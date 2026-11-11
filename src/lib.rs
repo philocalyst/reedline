@@ -96,7 +96,7 @@
 //! ```rust
 //! // Create a reedline object with tab completions support
 //!
-//! use reedline::{default_emacs_keybindings, ColumnarMenu, DefaultCompleter, Emacs, KeyCode, KeyModifiers, Reedline, ReedlineEvent, ReedlineMenu, MenuBuilder};
+//! use reedline::{default_emacs_keybindings, DefaultCompleter, Emacs, KeyCode, KeyModifiers, Reedline, ReedlineEvent, ReedlineMenu};
 //!
 //! let commands = vec![
 //!   "test".into(),
@@ -105,8 +105,8 @@
 //!   "this is the reedline crate".into(),
 //! ];
 //! let completer = Box::new(DefaultCompleter::new_with_wordlen(commands.clone(), 2));
-//! // Use the interactive menu to select options from the completer
-//! let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+//! // A menu the Tab binding below opens, answered by the completer
+//! let completion_menu = ReedlineMenu::new("completion_menu");
 //! // Set up the required keybindings
 //! let mut keybindings = default_emacs_keybindings();
 //! keybindings.add_binding(
@@ -122,7 +122,7 @@
 //!
 //! let mut line_editor = Reedline::create()
 //!     .with_completer(completer)
-//!     .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+//!     .with_menu(completion_menu)
 //!     .with_edit_mode(edit_mode);
 //! ```
 //!
@@ -337,8 +337,9 @@ pub use highlighter::{AbbrExpandContext, ExampleHighlighter, Highlighter, Simple
 
 mod completion;
 pub use completion::{
-    Completer, CompletionOrigin, CompletionResult, CompletionStatus, DefaultCompleter, Partial,
-    Span, Suggestion, Suggestions,
+    scroll_list, scroll_window, Completer, Completions, DefaultCompleter, DefaultPanel,
+    HistoryCompleter, Hit, Opening, Panel, PanelStyle, Pick, Preview, Region, Reply, Request, Span,
+    Suggestion, View,
 };
 
 mod hinter;
@@ -349,14 +350,10 @@ mod validator;
 pub use validator::{DefaultValidator, ValidationResult, Validator};
 
 mod status_line;
-pub use status_line::StatusLine;
+pub use status_line::{Sign, StatusLine};
 
 mod menu;
-pub use menu::{
-    menu_functions, ColumnarMenu, DescriptionMenu, DescriptionMode, DescriptionPosition, IdeMenu,
-    InputMode, ListMenu, Menu, MenuBuilder, MenuEvent, MenuSettings, MenuTextStyle, OutputMode,
-    ReedlineMenu, TraversalDirection,
-};
+pub use menu::ReedlineMenu;
 
 mod terminal_extensions;
 pub use terminal_extensions::kitty_protocol_available;
@@ -367,11 +364,13 @@ pub use terminal_extensions::semantic_prompt::{
 mod utils;
 
 mod external_printer;
+mod wake;
 pub use utils::{
     get_reedline_default_keybindings, get_reedline_keybinding_modifiers, get_reedline_keycodes,
 };
+pub use wake::Wake;
 
 // Reexport the key types to be independent from an explicit crossterm dependency.
 pub use crossterm::event::{KeyCode, KeyModifiers};
-pub use external_printer::{ExternalOutput, ExternalPrinter};
+pub use external_printer::{ExternalOutput, ExternalPrinter, PrinterSender};
 pub use nu_ansi_term::Color;

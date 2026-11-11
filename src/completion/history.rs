@@ -1,66 +1,42 @@
-use std::{collections::HashSet, ops::Deref};
+//! Lines from the history, for a history menu.
+
+use std::collections::HashSet;
 
 use crate::{
-    history::SearchQuery, menu_functions::parse_selection_char, Completer, CompletionResult,
-    History, HistoryItem, Result, Span, Suggestion,
+    history::SearchQuery, Completer, Completions, History, Reply, Request, Span, Suggestion,
 };
 
-const SELECTION_CHAR: char = '!';
+/// The most history lines a menu lists.
+const LIMIT: usize = 500;
 
-// The HistoryCompleter is created just before updating the menu
-// It pulls data from the object that contains access to the History
-pub(crate) struct HistoryCompleter<'menu>(&'menu dyn History);
+/// Offers the history lines that contain the line being edited, newest
+/// first and each once, to replace the whole line with.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HistoryCompleter;
 
-fn search_unique(
-    completer: &HistoryCompleter,
-    line: &str,
-) -> Result<impl Iterator<Item = HistoryItem>> {
-    let parsed = parse_selection_char(line, SELECTION_CHAR);
-    let values = completer.0.search(SearchQuery::all_that_contain_rev(
-        parsed.remainder.to_string(),
-    ))?;
-
-    let mut seen_matching_command_lines = HashSet::new();
-    Ok(values
-        .into_iter()
-        .filter(move |value| seen_matching_command_lines.insert(value.command_line.clone())))
-}
-
-impl Completer for HistoryCompleter<'_> {
-    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let suggestions = match search_unique(self, line) {
-            Err(_) => vec![],
-            Ok(search_results) => search_results
-                .map(|value| self.create_suggestion(line, pos, value.command_line.deref()))
-                .collect(),
+impl HistoryCompleter {
+    /// The lines of `history` containing `line`, newest first and each once.
+    pub fn suggestions(history: &dyn History, line: &str) -> Vec<Suggestion> {
+        let Ok(found) = history.search(SearchQuery::all_that_contain_rev(line.to_owned())) else {
+            return Vec::new();
         };
-        CompletionResult::fresh(suggestions)
+        let mut seen = HashSet::new();
+        found
+            .into_iter()
+            .filter(|item| seen.insert(item.command_line.clone()))
+            .take(LIMIT)
+            .map(|item| Suggestion {
+                value: item.command_line,
+                span: Span::new(0, line.len()),
+                ..Suggestion::default()
+            })
+            .collect()
     }
 }
 
-impl<'menu> HistoryCompleter<'menu> {
-    pub fn new(history: &'menu dyn History) -> Self {
-        Self(history)
-    }
-
-    /// Assumes `line.len() <= pos` (i.e. `line` is the cursor-prefix slice).
-    /// Update this span calculation before HistoryMenu opts into `InputMode::FullBuffer`,
-    /// where `line` would be the entire buffer and `pos - line.len()` would underflow.
-    fn create_suggestion(&self, line: &str, pos: usize, value: &str) -> Suggestion {
-        let span = Span {
-            start: pos - line.len(),
-            end: pos,
-        };
-
-        Suggestion {
-            value: value.to_string(),
-            description: None,
-            style: None,
-            extra: None,
-            span,
-            append_whitespace: false,
-            ..Default::default()
-        }
+impl Completer for HistoryCompleter {
+    fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+        reply.send(Self::suggestions(request.history, request.line).into());
     }
 }
 
@@ -71,85 +47,31 @@ mod tests {
     use super::*;
     use crate::*;
 
-    fn new_history_item(command_line: &str) -> HistoryItem {
-        HistoryItem {
-            id: None,
-            start_timestamp: None,
-            command_line: command_line.to_string(),
-            session_id: None,
-            hostname: None,
-            cwd: None,
-            duration: None,
-            exit_status: None,
-            more_info: None,
+    fn history_of(lines: &[&str]) -> FileBackedHistory {
+        let mut history = FileBackedHistory::new(lines.len().max(1)).expect("history");
+        for line in lines {
+            history
+                .save(HistoryItem::from_command_line(*line))
+                .expect("save");
         }
-    }
-
-    #[test]
-    fn duplicates_in_history() -> Result<()> {
-        let command_line_history = vec![
-            "git stash drop",
-            "git add .",
-            "git status | something | else",
-            "git status",
-            "git commit -m 'something'",
-            "ls",
-            "git push",
-            "git status",
-        ];
-        let expected_history_size = command_line_history.len();
-        let mut history = FileBackedHistory::new(command_line_history.len())?;
-        for command_line in command_line_history {
-            history.save(new_history_item(command_line))?;
-        }
-        let input = "git s";
-        let mut sut = HistoryCompleter::new(&history);
-
-        let completion = sut.complete(input, input.len());
-        let actual = completion.suggestions();
-        let (num_completions, _) = sut.paged_completions(input, input.len(), 0, 0);
-
-        assert_eq!(actual[0].value, "git status", "it was the last command");
-        assert_eq!(
-            actual[1].value, "git status | something | else",
-            "next match that is not 'git status' again even though it is next in history"
-        );
-        assert_eq!(actual[2].value, "git stash drop", "last match");
-        assert_eq!(actual.get(3), None);
-        assert_eq!(
-            3, num_completions,
-            "paged_completions total is consistent with complete"
-        );
-
-        assert_eq!(
-            history.count_all().expect("no error") as usize,
-            expected_history_size,
-            "History contains duplicates."
-        );
-        Ok(())
+        history
     }
 
     #[rstest]
-    #[case(vec![], "any", vec![])]
-    #[case(vec!["old match","recent match","between","recent match"], "match", vec!["recent match","old match"])]
-    #[case(vec!["a","b","c","a","b","c"], "", vec!["c","b","a"])]
-    fn complete_doesnt_return_duplicates(
-        #[case] history_items: Vec<&str>,
+    #[case(&[], "any", &[])]
+    #[case(&["old match", "recent match", "between", "recent match"], "match", &["recent match", "old match"])]
+    #[case(&["a", "b", "c", "a", "b", "c"], "", &["c", "b", "a"])]
+    #[case(&["git stash drop", "git status | x", "git status", "ls", "git status"], "git s", &["git status", "git status | x", "git stash drop"])]
+    fn newest_first_and_each_once(
+        #[case] lines: &[&str],
         #[case] line: &str,
-        #[case] expected: Vec<&str>,
-    ) -> Result<()> {
-        let mut history = FileBackedHistory::new(history_items.len())?;
-        for history_item in history_items {
-            history.save(new_history_item(history_item))?;
-        }
-        let mut sut = HistoryCompleter::new(&history);
-        let actual: Vec<String> = sut
-            .complete(line, line.len())
-            .suggestions()
-            .iter()
-            .map(|suggestion| suggestion.value.clone())
+        #[case] expected: &[&str],
+    ) {
+        let history = history_of(lines);
+        let found: Vec<String> = HistoryCompleter::suggestions(&history, line)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
             .collect();
-        assert_eq!(actual, expected);
-        Ok(())
+        assert_eq!(found, expected);
     }
 }

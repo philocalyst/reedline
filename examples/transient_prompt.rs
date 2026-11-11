@@ -7,8 +7,8 @@ use nu_ansi_term::{Color, Style};
 #[cfg(feature = "_sqlite")]
 use reedline::SqliteBackedHistory;
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, DefaultCompleter, DefaultHinter, DefaultPrompt, Emacs,
-    ExampleHighlighter, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode,
+    default_emacs_keybindings, DefaultCompleter, DefaultHinter, DefaultPrompt, Emacs,
+    ExampleHighlighter, KeyCode, KeyModifiers, Keybindings, Prompt, PromptEditMode,
     PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
     ValidationResult, Validator,
 };
@@ -90,8 +90,8 @@ fn main() -> io::Result<()> {
         "this is the reedline crate".into(),
     ];
     let completer = Box::new(DefaultCompleter::new_with_wordlen(commands.clone(), 2));
-    // Use the interactive menu to select options from the completer
-    let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+    // A menu the Tab binding opens, answered by the completer
+    let completion_menu = ReedlineMenu::new("completion_menu");
 
     let mut keybindings = default_emacs_keybindings();
     add_menu_keybindings(&mut keybindings);
@@ -103,7 +103,7 @@ fn main() -> io::Result<()> {
             DefaultHinter::default().with_style(Style::new().fg(Color::LightGray)),
         ))
         .with_completer(completer)
-        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_menu(completion_menu)
         .with_edit_mode(edit_mode)
         .with_highlighter(Box::new(ExampleHighlighter::new(commands)))
         .with_validator(Box::new(CustomValidator {}))

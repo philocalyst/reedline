@@ -1,12 +1,16 @@
 // Create a reedline object with tab completions support
 // cargo run --example completions
 //
-// "t" [Tab] will allow you to select the completions "test" and "this is the reedline crate"
-// [Enter] to select the chosen alternative
+// "t" [Tab] types the start the completions share, or selects the first one.
+// [Tab] again moves to the next one, [Esc] puts back what you typed, and
+// [Enter] takes the selected one.
+//
+// Completions show below the line as you type; remove
+// `with_passive_completions` to see them only after a [Tab].
 
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, DefaultCompleter, DefaultPrompt, EditCommand, Emacs,
-    KeyCode, KeyModifiers, Keybindings, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    default_emacs_keybindings, DefaultCompleter, DefaultPrompt, EditCommand, Emacs, KeyCode,
+    KeyModifiers, Keybindings, Reedline, ReedlineEvent, ReedlineMenu, Signal,
 };
 use std::io;
 
@@ -27,13 +31,6 @@ fn add_menu_keybindings(keybindings: &mut Keybindings) {
 }
 
 fn main() -> io::Result<()> {
-    // Number of columns
-    let columns: u16 = 4;
-    // Column width
-    let col_width: Option<usize> = None;
-    // Column padding
-    let col_padding: usize = 2;
-
     let commands = vec![
         "test".into(),
         "clear".into(),
@@ -59,15 +56,6 @@ fn main() -> io::Result<()> {
 
     let completer = Box::new(DefaultCompleter::new_with_wordlen(commands, 2));
 
-    // Use the interactive menu to select options from the completer
-    let columnar_menu = ColumnarMenu::default()
-        .with_name("completion_menu")
-        .with_columns(columns)
-        .with_column_width(col_width)
-        .with_column_padding(col_padding);
-
-    let completion_menu = Box::new(columnar_menu);
-
     let mut keybindings = default_emacs_keybindings();
     add_menu_keybindings(&mut keybindings);
 
@@ -75,7 +63,9 @@ fn main() -> io::Result<()> {
 
     let mut line_editor = Reedline::create()
         .with_completer(completer)
-        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_menu(ReedlineMenu::new("completion_menu"))
+        .with_passive_completions(true)
+        .with_panel_rows(6)
         .with_edit_mode(edit_mode);
 
     let prompt = DefaultPrompt::default();

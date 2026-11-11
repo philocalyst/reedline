@@ -19,10 +19,10 @@ pub use vi::{
 
 use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::{EditCommand, ReedlineEvent};
+use crate::{EditCommand, MouseButton, ReedlineEvent};
 
 /// Lower the non-key terminal events every edit mode treats identically:
-/// primary-button clicks, resize, focus, and bracketed paste with its
+/// primary-button clicks, the wheel, resize, focus, and bracketed paste with its
 /// newlines normalized.
 fn parse_non_key_event(event: Event) -> ReedlineEvent {
     match event {
@@ -37,6 +37,21 @@ fn parse_non_key_event(event: Event) -> ReedlineEvent {
             column,
             row,
             button: button.into(),
+        },
+        // The wheel, whatever the modifiers.
+        Event::Mouse(MouseEvent {
+            kind: kind @ (MouseEventKind::ScrollUp | MouseEventKind::ScrollDown),
+            column,
+            row,
+            ..
+        }) => ReedlineEvent::Mouse {
+            column,
+            row,
+            button: if kind == MouseEventKind::ScrollUp {
+                MouseButton::ScrollUp
+            } else {
+                MouseButton::ScrollDown
+            },
         },
         Event::Mouse(_) => ReedlineEvent::None,
         Event::Resize(width, height) => ReedlineEvent::Resize(width, height),

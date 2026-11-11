@@ -37,6 +37,13 @@ impl StyledText {
     /// whole grapheme instead of splitting it. Pairs the range does not touch
     /// are kept whole; no zero-length pair is ever produced.
     pub fn style_range(&mut self, from: usize, to: usize, new_style: Style) {
+        self.map_range(from, to, |_| new_style);
+    }
+
+    /// Restyles the text between byte offsets `from` and `to` with `restyle`
+    /// applied to the style each part has, as [`StyledText::style_range`]
+    /// does with a fixed style.
+    pub(crate) fn map_range(&mut self, from: usize, to: usize, restyle: impl Fn(Style) -> Style) {
         let (from, to) = (from.min(to), from.max(to));
         let mut rebuilt = Vec::with_capacity(self.buffer.len() + 2);
         let mut start = 0;
@@ -48,7 +55,7 @@ impl StyledText {
 
             match (text.get(..lo), text.get(lo..hi), text.get(hi..)) {
                 (Some(before), Some(styled), Some(after)) if lo < hi => {
-                    let pieces = [(style, before), (new_style, styled), (style, after)];
+                    let pieces = [(style, before), (restyle(style), styled), (style, after)];
                     rebuilt.extend(
                         pieces
                             .into_iter()

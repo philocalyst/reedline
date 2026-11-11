@@ -1,6 +1,8 @@
 mod query;
 
 pub(crate) mod environment;
+#[cfg(feature = "bashisms")]
+pub(crate) mod selection;
 pub(crate) mod text_manipulation;
 
 pub use query::{

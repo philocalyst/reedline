@@ -19,6 +19,10 @@ pub enum MouseButton {
     Right,
     /// Middle mouse button
     Middle,
+    /// The wheel turned up, reported like a press as terminals do
+    ScrollUp,
+    /// The wheel turned down
+    ScrollDown,
 }
 
 impl From<crossterm::event::MouseButton> for MouseButton {
@@ -1244,6 +1248,19 @@ pub enum ReedlineEvent {
 
     /// Move to the previous history page
     MenuPagePrevious,
+
+    /// Cycle the preview of the selected suggestion through folded, unfolded
+    /// and hidden, for the session. While shown, moving through the
+    /// completions pops it out beside them, as the completer draws it. A
+    /// preview with nothing folded away skips the unfolded step, so it only
+    /// toggles.
+    MenuPreview,
+
+    /// Scroll the preview of the selected suggestion up by half its height.
+    PreviewUp,
+
+    /// Scroll the preview of the selected suggestion down by half its height.
+    PreviewDown,
 
     /// Triggers an immediate return from [`Reedline::read_line()`](crate::Reedline::read_line) with an opaque payload.
     ///

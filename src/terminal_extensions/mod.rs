@@ -1,5 +1,6 @@
 pub(crate) mod bracketed_paste;
 pub(crate) mod kitty;
+pub(crate) mod mouse;
 pub mod semantic_prompt;
 pub(crate) mod tty_mode;
 
