@@ -8,12 +8,13 @@ use {
     nu_ansi_term::{Color, Style},
     reedline::{
         default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-        default_vi_visual_keybindings, ColumnarMenu, DefaultCompleter, DefaultHinter,
-        DefaultPrompt, DefaultValidator, EditCommand, EditMode, Emacs, ExampleHighlighter,
-        Keybindings, ListMenu, Reedline, ReedlineEvent, ReedlineMenu, Signal, Vi,
+        default_vi_visual_keybindings, DefaultCompleter, DefaultHinter, DefaultPrompt,
+        DefaultValidator, EditCommand, EditMode, Emacs, ExampleHighlighter, Keybindings, Reedline,
+        ReedlineEvent, ReedlineMenu, Signal, Vi,
     },
 };
 
+use reedline::CursorConfig;
 #[cfg(not(feature = "_sqlite"))]
 use reedline::FileBackedHistory;
 #[cfg(feature = "_sqlite")]
@@ -22,7 +23,6 @@ use reedline::{
     default_helix_insert_keybindings, default_helix_normal_keybindings,
     default_helix_select_keybindings, DefaultPromptSegment, Helix,
 };
-use reedline::{CursorConfig, MenuBuilder, OutputMode};
 use reedline::{PromptEditMode, PromptHelixMode, PromptViMode};
 
 fn main() -> reedline::Result<()> {
@@ -121,14 +121,8 @@ fn main() -> reedline::Result<()> {
 
     // Adding default menus for the compiled reedline
     line_editor = line_editor
-        .with_menu(ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        )))
-        .with_menu(ReedlineMenu::HistoryMenu(Box::new(
-            ListMenu::default()
-                .with_name("history_menu")
-                .with_output_mode(OutputMode::FullBuffer),
-        )));
+        .with_menu(ReedlineMenu::new("completion_menu"))
+        .with_menu(ReedlineMenu::history("history_menu"));
 
     // Every machine is registered so the F5 / F6 / F7 bindings can switch
     // between them; the flag only picks which one starts active.

@@ -94,6 +94,7 @@ impl Editor {
     }
 
     /// Mutable [`LineBuffer`] access, no undo.
+    #[cfg(test)]
     pub(crate) fn line_buffer_mut(&mut self) -> &mut LineBuffer {
         &mut self.line_buffer
     }
@@ -830,20 +831,15 @@ impl Editor {
     /// A caret cursor rests *on* a grapheme and [`Self::insertion_point`]
     /// reports that grapheme's start, so completing there strands it
     /// (`foo` -> `foobaro`). Complete at its far edge instead — where insert
-    /// mode sits, since leaving insert steps one grapheme back.
+    /// mode sits, since leaving insert steps one grapheme back. A caret on a
+    /// line terminator completes at the caret, so the lines are never joined.
     pub(crate) fn completion_point(&self) -> usize {
         let pos = self.insertion_point();
         if self.edit_mode.rest_policy() == RestPolicy::Between {
             return pos;
         }
         let buf = self.line_buffer.get_buffer();
-        // Grapheme-aware: `pos + 1` would split a multi-byte grapheme.
-        // Yields `buf.len()` at the end, so no separate guard.
         let next = next_grapheme_boundary(buf, pos);
-        // No current policy rests the caret *on* a line terminator (`Block`
-        // widens backward off it), but a Helix-faithful policy that does would
-        // otherwise pull the newline into the completed span and join the two
-        // lines. The word ends at the caret there.
         if buf[pos..next].starts_with(['\n', '\r']) {
             pos
         } else {

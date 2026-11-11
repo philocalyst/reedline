@@ -155,6 +155,12 @@ pub fn add_common_navigation_bindings(kb: &mut Keybindings) {
         ]),
     );
 
+    // A preview of the selected suggestion, beside or under the completions
+    kb.add_binding(KM::ALT, KC::Char('p'), ReedlineEvent::MenuPreview);
+    // Scrolling that preview, as the wheel over it does
+    kb.add_binding(KM::ALT, KC::Up, ReedlineEvent::PreviewUp);
+    kb.add_binding(KM::ALT, KC::Down, ReedlineEvent::PreviewDown);
+
     // Ctrl Left and Right
     kb.add_binding(
         KM::CONTROL,

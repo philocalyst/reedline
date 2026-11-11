@@ -1,4 +1,4 @@
-use crate::{Completer, CompletionResult, Span, Suggestion};
+use crate::{Completer, Completions, Reply, Request, Span, Suggestion};
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::Chars,
@@ -38,6 +38,12 @@ impl Default for DefaultCompleter {
     }
 }
 impl Completer for DefaultCompleter {
+    fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+        reply.send(self.suggestions(request.line, request.cursor).into());
+    }
+}
+
+impl DefaultCompleter {
     /// Returns a vector of completions and the position in which they must be replaced;
     /// based on the provided input.
     ///
@@ -48,12 +54,12 @@ impl Completer for DefaultCompleter {
     ///
     /// # Example
     /// ```
-    /// use reedline::{DefaultCompleter,Completer,Span,Suggestion};
+    /// use reedline::{DefaultCompleter,Span,Suggestion};
     ///
     /// let mut completions = DefaultCompleter::default();
     /// completions.insert(vec!["batman","robin","batmobile","batcave","robber"].iter().map(|s| s.to_string()).collect());
     /// assert_eq!(
-    ///     completions.complete("bat",3).suggestions(),
+    ///     completions.suggestions("bat",3),
     ///     vec![
     ///         Suggestion {value: "batcave".into(), description: None, style: None, extra: None, span: Span { start: 0, end: 3 }, append_whitespace: false, ..Default::default()},
     ///         Suggestion {value: "batman".into(), description: None, style: None, extra: None, span: Span { start: 0, end: 3 }, append_whitespace: false, ..Default::default()},
@@ -61,14 +67,14 @@ impl Completer for DefaultCompleter {
     ///     ]);
     ///
     /// assert_eq!(
-    ///     completions.complete("to the\r\nbat",11).suggestions(),
+    ///     completions.suggestions("to the\r\nbat",11),
     ///     vec![
     ///         Suggestion {value: "batcave".into(), description: None, style: None, extra: None, span: Span { start: 8, end: 11 }, append_whitespace: false, ..Default::default()},
     ///         Suggestion {value: "batman".into(), description: None, style: None, extra: None, span: Span { start: 8, end: 11 }, append_whitespace: false, ..Default::default()},
     ///         Suggestion {value: "batmobile".into(), description: None, style: None, extra: None, span: Span { start: 8, end: 11 }, append_whitespace: false, ..Default::default()},
     ///     ]);
     /// ```
-    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+    pub fn suggestions(&self, line: &str, pos: usize) -> Vec<Suggestion> {
         let mut span_line_whitespaces = 0;
         let mut completions = vec![];
         // Trimming in case someone passes in text containing stuff after the cursor, if
@@ -121,7 +127,7 @@ impl Completer for DefaultCompleter {
             }
         }
         completions.dedup();
-        CompletionResult::fresh(completions)
+        completions
     }
 }
 
@@ -182,13 +188,13 @@ impl DefaultCompleter {
     /// let mut completions = DefaultCompleter::default();
     /// completions.insert(vec!["test-hyphen","test_underscore"].iter().map(|s| s.to_string()).collect());
     /// assert_eq!(
-    ///     completions.complete("te",2).suggestions(),
+    ///     completions.suggestions("te",2),
     ///     vec![Suggestion {value: "test".into(), description: None, style: None, extra: None, span: Span { start: 0, end: 2 }, append_whitespace: false, ..Default::default()}]);
     ///
     /// let mut completions = DefaultCompleter::with_inclusions(&['-', '_']);
     /// completions.insert(vec!["test-hyphen","test_underscore"].iter().map(|s| s.to_string()).collect());
     /// assert_eq!(
-    ///     completions.complete("te",2).suggestions(),
+    ///     completions.suggestions("te",2),
     ///     vec![
     ///         Suggestion {value: "test-hyphen".into(), description: None, style: None, extra: None, span: Span { start: 0, end: 2 }, append_whitespace: false, ..Default::default()},
     ///         Suggestion {value: "test_underscore".into(), description: None, style: None, extra: None, span: Span { start: 0, end: 2 }, append_whitespace: false, ..Default::default()},
@@ -376,7 +382,7 @@ mod tests {
         );
 
         assert_eq!(
-            completions.complete("ｎ", 3).suggestions(),
+            completions.suggestions("ｎ", 3),
             [
                 Suggestion {
                     value: "ｎｕｌｌ".into(),
@@ -421,9 +427,8 @@ mod tests {
 
         let buffer = "this is t";
 
-        let (result, ranges) = completions.complete_with_base_ranges(buffer, 9);
         assert_eq!(
-            result.suggestions(),
+            completions.suggestions(buffer, 9),
             [
                 Suggestion {
                     value: "test".into(),
@@ -453,12 +458,6 @@ mod tests {
                     ..Default::default()
                 },
             ]
-        );
-
-        assert_eq!(ranges, [8..9, 0..9]);
-        assert_eq!(
-            ["t", "this is t"],
-            [&buffer[ranges[0].clone()], &buffer[ranges[1].clone()]]
         );
     }
 }

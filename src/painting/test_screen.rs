@@ -94,6 +94,12 @@ impl TestScreen {
             .collect()
     }
 
+    /// How the cell at `column` of `row` is drawn: whether it is dim, underlined and reversed.
+    pub(crate) fn cell_style(&self, row: u16, column: u16) -> Option<(bool, bool, bool)> {
+        let cell = self.parser.screen().cell(row, column)?;
+        Some((cell.dim(), cell.underline(), cell.inverse()))
+    }
+
     /// Where the cursor is, as `(column, row)` like the painter and crossterm
     /// count it. The column equals the screen width while a wrap is pending.
     pub(crate) fn cursor(&self) -> (u16, u16) {
@@ -109,28 +115,10 @@ impl TestScreen {
         (column.min(width.saturating_sub(1)), row)
     }
 
-    /// The rows pushed off the top into scrollback, oldest first, trailing
-    /// blanks trimmed.
-    pub(crate) fn scrollback_rows(&mut self) -> Vec<String> {
-        let total = self.scrolled();
-        let (_, width) = self.parser.screen().size();
-        let screen = self.parser.screen_mut();
-        // With the view `offset` rows up, its top row is the one `offset`
-        // rows above the screen.
-        let rows = (1..=total)
-            .rev()
-            .map(|offset| {
-                screen.set_scrollback(offset);
-                screen
-                    .rows(0, width)
-                    .next()
-                    .unwrap_or_default()
-                    .trim_end()
-                    .to_owned()
-            })
-            .collect();
-        screen.set_scrollback(0);
-        rows
+    /// Changes the screen size. `vt100` truncates rather than reflows, so a
+    /// test of a reflowing terminal feeds the reflowed rows itself.
+    pub(crate) fn resize(&mut self, width: u16, height: u16) {
+        self.parser.screen_mut().set_size(height, width);
     }
 
     pub(crate) fn cursor_visible(&self) -> bool {

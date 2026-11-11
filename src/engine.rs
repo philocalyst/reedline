@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     ffi::{OsStr, OsString},
     mem,
@@ -7,16 +8,26 @@ use std::{
 };
 
 use nu_ansi_term::{Color, Style};
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{enums::ReedlineRawEvent, external_printer::ExternalOutput, CursorConfig};
+use crate::{
+    enums::ReedlineRawEvent,
+    external_printer::ExternalOutput,
+    wake::{Input, Wake},
+    CursorConfig,
+};
 #[cfg(feature = "bashisms")]
 use crate::{
     history::SearchFilter,
-    menu_functions::{parse_selection_char, ParseAction},
+    utils::selection::{parse_selection_char, ParseAction},
 };
 use {
     crate::{
-        completion::{Completer, CompletionOrigin, CompletionStatus, DefaultCompleter},
+        completion::{
+            session::{Drawn, Session, Tab},
+            Completer, Completions, DefaultCompleter, DefaultPanel, Hit, Opening, Panel, Region,
+            Request, View,
+        },
         core_editor::{EditCommandStatus, Editor},
         edit_mode::{EditMode, Emacs},
         enums::{EventStatus, ReedlineEvent},
@@ -28,21 +39,21 @@ use {
         },
         painting::{
             continue_hint_lines, escape_control, escape_control_keep_sgr, Painter,
-            PainterSuspendedState, PromptLines, RenderSnapshot, W,
+            PainterSuspendedState, PromptLines, RenderSnapshot, Room, W,
         },
-        prompt::{PromptEditMode, PromptHistorySearchStatus},
+        prompt::{PromptEditMode, PromptHelixMode, PromptHistorySearchStatus, PromptViMode},
         result::{ReedlineError, ReedlineErrorVariants},
         terminal_extensions::{
             bracketed_paste::BracketedPasteGuard,
             kitty::KittyProtocolGuard,
+            mouse::MouseGuard,
             semantic_prompt::{Osc133ClickEventsMarkers, SemanticPromptMarkers},
             tty_mode::TtyModeGuard,
         },
         utils::text_manipulation,
         AbbrExpandContext, AutoPairAction, AutoPairContext, AutoPairs, EditCommand,
-        ExampleHighlighter, Highlighter, LineBuffer, Menu, MenuEvent, MouseButton, Prompt,
-        PromptHistorySearch, ReedlineMenu, Signal, StatusLine, UndoBehavior, ValidationResult,
-        Validator,
+        ExampleHighlighter, Highlighter, LineBuffer, MouseButton, Prompt, PromptHistorySearch,
+        ReedlineMenu, Signal, StatusLine, UndoBehavior, ValidationResult, Validator,
     },
     crossterm::{
         cursor::SetCursorStyle,
@@ -80,6 +91,18 @@ const EVENTS_THRESHOLD: usize = 10;
 /// for features that require periodic processing (e.g., external printer,
 /// idle callback).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The widest a preview is asked to be, in columns.
+const PREVIEW_WIDTH: u16 = 80;
+
+/// The most rows the completion panel takes unless told otherwise.
+const DEFAULT_PANEL_ROWS: u16 = 8;
+
+/// A turn of the mouse wheel scrolls a preview by this fraction of its height, and at least a row.
+const WHEEL_FRACTION: u16 = 4;
+
+/// How soon after a click on an item of the panel a second one on it takes it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 /// Where history navigation leaves the cursor in the entry it shows.
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +175,19 @@ impl HistoryLastRun {
     }
 }
 
+/// Text the completer had the line go on with, as [`Completer::opening`] answered, and the line
+/// as that left it: the next key may still take it back.
+struct Opened {
+    line: String,
+    cursor: usize,
+    /// Where the text starts.
+    at: usize,
+    /// How long the text is.
+    len: usize,
+    /// What the text starts with.
+    first: Option<char>,
+}
+
 /// Line editor engine
 ///
 /// ## Example usage
@@ -203,13 +239,31 @@ pub struct Reedline {
     /// `edit_mode`, offered a target in registration order.
     standby_edit_modes: Vec<Box<dyn EditMode>>,
 
-    // Provides the tab completions
-    completer: Box<dyn Completer + Send>,
-    quick_completions: bool,
-    partial_completions: bool,
-    persistent_menus: bool,
-    // Completions owed to a menu activation the completer could not answer in time
-    deferred_menu_completion: Option<DeferredMenuCompletion>,
+    // Provides the tab completions, what of them is shown, and how
+    completer: Box<dyn Completer>,
+    completion: Session,
+
+    /// What the completer last had the line go on with, while the next key may still take it
+    /// back.
+    opened: Option<Opened>,
+    /// The line and cursor right after the editor put a space before the cursor, taking a
+    /// suggestion or opening what must follow: a space typed there goes over it.
+    spaced: Option<(String, usize)>,
+    panel: Box<dyn Panel>,
+    panel_rows: u16,
+    /// The screen column the panel's word started at in the last paint.
+    panel_anchor: u16,
+    /// The width the preview on screen was asked for.
+    preview_asked: u16,
+    /// The width the panel wants previews at, as of the last paint.
+    preview_wanted: Option<u16>,
+    /// The rows the preview could take in the last paint, inside its frame:
+    /// how far it scrolls.
+    preview_rows: u16,
+    /// The rows the list could take in the last paint: how far a page moves the selection.
+    list_room: u16,
+    /// Mouse reporting, on while the panel is.
+    mouse: MouseGuard,
 
     // Optional host hook that intercepts a lone `PasteSystem` paste
     // (see `crate::PasteInterceptor`). `PasteSystem` only exists under
@@ -248,11 +302,19 @@ pub struct Reedline {
     // Whether to enable mouse click-to-cursor functionality
     mouse_click_mode: MouseClickMode,
 
+    // The preview of the highlighted suggestion is out of date: the wheel moved the highlight,
+    // and the next repaint asks for the preview once however many turns there were.
+    preview_pending: bool,
+
+    // The last click on an item of the panel, when and which: a second click on it soon
+    // after takes it, where a first only selects.
+    last_item_click: Option<(std::time::Instant, usize)>,
+
     // Current working directory as defined by the application. If set, it will
     // override the actual working directory of the process.
     cwd: Option<String>,
 
-    // Engine Menus
+    // Named menus, each answered by its own completer or the editor's
     menus: Vec<ReedlineMenu>,
 
     abbreviations: HashMap<String, String>,
@@ -286,6 +348,10 @@ pub struct Reedline {
     poll_interval: Duration,
 
     external_printer: Option<Box<dyn ExternalOutput>>,
+
+    // Terminal input, and the handle other threads wake the editor with.
+    input: Input,
+    wake: Wake,
 
     // Callback function that is called periodically while waiting for input.
     // Useful for processing external events (e.g., GUI updates) during idle time.
@@ -411,57 +477,52 @@ impl BufferEditor {
     }
 }
 
-/// The completions the [`Menu`](ReedlineEvent::Menu) event could not decide, because the
-/// completer had not answered yet.
-///
-/// Activating a menu immediately inspects its values twice: quick completions accept a
-/// lone suggestion, and partial completions splice in the prefix the suggestions share.
-/// A completer computing in the background can answer neither yet.
-///
-/// The snapshot pins the editor state as of the keystroke this was armed on: a result
-/// landing after the user has typed on is discarded rather than rewriting the line
-/// underneath them.
-struct DeferredMenuCompletion {
-    menu: String,
-    /// The line this was armed on, stamped as a completer stamps its own results.
-    origin: CompletionOrigin,
-}
-
-impl DeferredMenuCompletion {
-    fn new(menu: &ReedlineMenu, editor: &Editor) -> Self {
-        Self {
-            menu: menu.name().to_string(),
-            origin: CompletionOrigin::new(editor.get_buffer(), editor.insertion_point()),
-        }
-    }
-
-    /// Whether the line is still exactly as it was when this was armed, on the same menu.
-    /// Anything else means the user moved on and the decision is void.
-    fn still_applies(&self, menu: &ReedlineMenu, editor: &Editor) -> bool {
-        self.menu == menu.name()
-            && self
-                .origin
-                .matches(editor.get_buffer(), editor.insertion_point())
-    }
-}
-
 /// Call [`request_repaint`](RepaintSignal::request_repaint) once
 /// new prompt data is ready! The next iteration of the input loop re-evaluates
 /// the [`Prompt`] and redraws it without interrupting the current line edit.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RepaintSignal {
     flag: Arc<AtomicBool>,
+    wake: Wake,
 }
 
 impl RepaintSignal {
     /// Request that the prompt is re-evaluated and repainted in place.
     pub fn request_repaint(&self) {
         self.flag.store(true, Ordering::Relaxed);
+        self.wake.wake();
     }
 
     /// Consume a pending repaint request.
     fn take(&self) -> bool {
         self.flag.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// The view the panel is asked about for the room a preview may have: with no
+/// preview, so that the answer does not depend on what it holds.
+fn room_view(
+    completions: &Completions,
+    selected: Option<usize>,
+    anchor: u16,
+    width: u16,
+    rows: u16,
+) -> View<'_> {
+    View {
+        completions,
+        selected,
+        anchor,
+        width,
+        rows,
+        list_rows: rows,
+        still_rows: u16::MAX,
+        preview: None,
+        unfolded: false,
+        list_offset: 0,
+        list_scrolloff: 0,
+        preview_offset: 0,
+        pick: None,
+        use_ansi_coloring: false,
     }
 }
 
@@ -478,23 +539,6 @@ impl Drop for Reedline {
         // Ensures that the terminal is in a good state if we panic semigracefully
         // Calling `disable_raw_mode()` twice is fine with Linux
         let _ignore = terminal::disable_raw_mode();
-    }
-}
-
-/// Mark the painter's cached prompt anchor stale around a menu running its completer,
-/// which may have left the cached row pointing at content that has scrolled. See
-/// [`ReedlineMenu::queries_host_completer`] for why only some completers count, and
-/// #1130 for the bug.
-///
-/// Also skipped for a menu the same keystroke deactivated, whose queued event nothing
-/// goes on to consume.
-///
-/// Call this from every event that reaches the completer, which is not the same set as
-/// the events that change the menu's selection: `MenuNext` splices a partial completion
-/// and queries, while `MenuPrevious` only moves and does not.
-fn invalidate_anchor_if_host_completer_runs(menu: &ReedlineMenu, painter: &mut Painter) {
-    if menu.is_active() && menu.queries_host_completer() {
-        painter.invalidate_prompt_start_row();
     }
 }
 
@@ -551,6 +595,7 @@ impl Reedline {
         let buffer_highlighter = Box::<ExampleHighlighter>::default();
         let visual_selection_style = Style::new().on(Color::LightGray);
         let completer = Box::<DefaultCompleter>::default();
+        let wake = Wake::default();
         let hinter = None;
         let validator = None;
         let edit_mode = Box::<Emacs>::default();
@@ -575,10 +620,17 @@ impl Reedline {
             edit_mode,
             standby_edit_modes: Vec::new(),
             completer,
-            quick_completions: false,
-            partial_completions: false,
-            persistent_menus: false,
-            deferred_menu_completion: None,
+            completion: Session::new(wake.clone()),
+            opened: None,
+            spaced: None,
+            panel: Box::<DefaultPanel>::default(),
+            panel_rows: DEFAULT_PANEL_ROWS,
+            panel_anchor: 0,
+            preview_asked: PREVIEW_WIDTH,
+            preview_wanted: None,
+            preview_rows: DEFAULT_PANEL_ROWS,
+            list_room: DEFAULT_PANEL_ROWS,
+            mouse: MouseGuard::default(),
             #[cfg(feature = "system_clipboard")]
             paste_interceptor: None,
             paste_burst: None,
@@ -592,6 +644,8 @@ impl Reedline {
             use_ansi_coloring: true,
             auto_pairs: None,
             mouse_click_mode: MouseClickMode::default(),
+            preview_pending: false,
+            last_item_click: None,
             cwd: None,
             menus: Vec::new(),
             abbreviations: HashMap::new(),
@@ -604,6 +658,8 @@ impl Reedline {
             repaint_signal: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
             external_printer: None,
+            input: Input::default(),
+            wake,
             idle_callback: None,
         }
     }
@@ -724,16 +780,40 @@ impl Reedline {
     /// let mut line_editor = Reedline::create().with_completer(completer);
     /// ```
     #[must_use]
-    pub fn with_completer(mut self, completer: Box<dyn Completer + Send>) -> Self {
+    pub fn with_completer(mut self, completer: Box<dyn Completer>) -> Self {
         self.completer = completer;
         self
     }
 
-    /// Turn on quick completions. These completions will auto-select if the completer
-    /// ever narrows down to a single entry.
+    /// Draw completions with `panel` instead of the [`DefaultPanel`].
+    #[must_use]
+    pub fn with_panel(mut self, panel: Box<dyn Panel>) -> Self {
+        self.panel = panel;
+        self
+    }
+
+    /// The most rows the completion panel takes, 8 by default. It takes fewer
+    /// when the screen has less room, down to a strip in the status row.
+    #[must_use]
+    pub fn with_panel_rows(mut self, rows: u16) -> Self {
+        self.panel_rows = rows.max(1);
+        self
+    }
+
+    /// Show completions as the line is typed, before any Tab. Nothing is
+    /// selected until Tab is pressed, so Enter still runs the line. Off by
+    /// default.
+    #[must_use]
+    pub fn with_passive_completions(mut self, passive: bool) -> Self {
+        self.completion.passive = passive;
+        self
+    }
+
+    /// Turn on quick completions: a Tab with one suggestion takes it at once.
+    /// On by default.
     #[must_use]
     pub fn with_quick_completions(mut self, quick_completions: bool) -> Self {
-        self.quick_completions = quick_completions;
+        self.completion.quick = quick_completions;
         self
     }
 
@@ -783,20 +863,7 @@ impl Reedline {
     /// smallest common string from all the options
     #[must_use]
     pub fn with_partial_completions(mut self, partial_completions: bool) -> Self {
-        self.partial_completions = partial_completions;
-        self
-    }
-
-    /// Make active menus persist while the line is edited: erasing characters
-    /// or emptying the line refilters the menu instead of dismissing it.
-    ///
-    /// When disabled (the default), an active menu is deactivated by a backspace
-    /// when quick completions are on, and by any edit that leaves the line
-    /// buffer empty. A persistent menu still closes on Esc, Ctrl-C, or when a
-    /// value is accepted.
-    #[must_use]
-    pub fn with_persistent_menus(mut self, persistent_menus: bool) -> Self {
-        self.persistent_menus = persistent_menus;
+        self.completion.partial = partial_completions;
         self
     }
 
@@ -844,10 +911,7 @@ impl Reedline {
     ///
     /// Auto-pairing applies to edits in the regular line buffer. Reverse-history
     /// search edits a separate search query and are not passed through the
-    /// auto-pairing machinery. Neither is typing while a menu in
-    /// [`InputMode::Diff`](crate::InputMode::Diff) is open, such as a
-    /// [`ListMenu`](crate::ListMenu) used for history, since that text is the
-    /// menu's query.
+    /// auto-pairing machinery.
     #[must_use]
     pub fn with_auto_pairs(mut self, auto_pairs: AutoPairs) -> Self {
         self.auto_pairs = Some(auto_pairs);
@@ -1163,8 +1227,12 @@ impl Reedline {
     /// running, avoiding interfering with current line edit.
     pub fn repaint_signal(&mut self) -> RepaintSignal {
         // The handle is created lazily on the first call; subsequent calls return clones
+        let wake = self.wake.clone();
         self.repaint_signal
-            .get_or_insert_with(RepaintSignal::default)
+            .get_or_insert_with(|| RepaintSignal {
+                flag: Arc::default(),
+                wake,
+            })
             .clone()
     }
 
@@ -1294,6 +1362,8 @@ impl Reedline {
         self.kitty_protocol.enter();
 
         let result = self.read_line_helper(prompt);
+        // Nothing may watch the terminal while the host runs a command.
+        self.input.release();
         if result.is_err() {
             // The error is what to report, not a failure to show.
             let _ignore = self.painter.show_cursor();
@@ -1301,6 +1371,7 @@ impl Reedline {
 
         self.bracketed_paste.exit();
         self.kitty_protocol.exit();
+        self.mouse.set(false);
         terminal::disable_raw_mode()?;
         result
     }
@@ -1347,24 +1418,17 @@ impl Reedline {
             .is_some_and(RepaintSignal::take)
     }
 
-    /// Whether the input loop must poll with a timeout instead of blocking
-    /// indefinitely, so external triggers (break signal, repaint signal,
-    /// external printer, idle callback) are noticed while waiting for input.
+    /// Whether the input loop must poll with a timeout instead of sleeping
+    /// until something wakes it. Only the triggers that cannot wake it need
+    /// that: an idle callback, which is periodic by definition, a break flag,
+    /// and an external output that does not wake the editor.
     fn input_needs_polling(&self) -> bool {
-        #[allow(unused_mut)] // Dependent on feature flags
-        let mut poll = self.break_signal.is_some()
+        self.break_signal.is_some()
+            || self.idle_callback.is_some()
             || self
-                .repaint_signal
+                .external_printer
                 .as_ref()
-                .is_some_and(|sig| Arc::strong_count(&sig.flag) > 1);
-
-        {
-            poll |= self.external_printer.is_some();
-        }
-
-        poll |= self.idle_callback.is_some();
-
-        poll
+                .is_some_and(|printer| !printer.wakes())
     }
 
     /// Reset the per-call state at the start of a `read_line`, before anything
@@ -1433,27 +1497,25 @@ impl Reedline {
                 }
             }
 
-            // Determine if we need to poll (non-blocking) or can block on input.
-            // We need polling if external_printer or idle_callback is configured,
-            // using the shared poll_interval for the timeout.
-            let status = self.completer.poll_completion();
-            // Anything BUT idle means work is in flight. We need to keep polling.
-            let completer_pending = status != CompletionStatus::Idle;
-
-            if status == CompletionStatus::Ready {
-                self.settle_completions(prompt)?;
+            // Completions or a preview a background completer sent.
+            if self.land_completions() {
+                self.repaint(prompt)?;
             }
 
             let mut events: Vec<Event> = vec![];
 
             if !self.immediately_accept {
-                if self.input_needs_polling() || completer_pending {
+                if self.input_needs_polling() {
                     if event::poll(self.poll_interval)? {
                         events.push(crossterm::event::read()?);
                     }
                 } else {
-                    // Block until we receive an event
-                    events.push(crossterm::event::read()?);
+                    // Sleep until the terminal has an event or something woke
+                    // the editor, which the top of the loop then looks at.
+                    match self.input.wait(&self.wake)? {
+                        Some(event) => events.push(event),
+                        None => continue,
+                    }
                 }
 
                 // Receive all events in the queue without blocking. Will stop when
@@ -1463,11 +1525,18 @@ impl Reedline {
                     events.push(crossterm::event::read()?);
                 }
 
-                // If we believe there's text pasting or resizing going on, batch
-                // more events at the cost of a slight delay.
-                if events.len() > EVENTS_THRESHOLD
-                    || events.iter().any(|e| matches!(e, Event::Resize(_, _)))
-                {
+                // Keep legacy unbracketed-paste batching, including when a
+                // resize happens during a paste. Resize events themselves do
+                // not count toward the paste threshold or trigger a wait. Nor do
+                // mouse events: a flick of the wheel is dozens of them, which is
+                // no paste, and holding them back until the burst ends would
+                // scroll nothing and then everything at once.
+                let input_events = events
+                    .iter()
+                    .filter(|event| !matches!(event, Event::Resize(_, _) | Event::Mouse(_)))
+                    .take(EVENTS_THRESHOLD + 1)
+                    .count();
+                if input_events > EVENTS_THRESHOLD {
                     while !Self::line_input_completed(&events) && event::poll(POLL_WAIT)? {
                         events.push(crossterm::event::read()?);
                     }
@@ -1567,97 +1636,206 @@ impl Reedline {
         }
     }
 
-    /// Fold a finished completion request into the active menu, and honor the completions
-    /// owed from when the request was made.
-    ///
-    /// Called when the completer reports [`CompletionStatus::Ready`]. Kept out of the
-    /// input loop so it is reachable from tests, which cannot drive the loop itself.
-    fn settle_completions(&mut self, prompt: &dyn Prompt) -> Result<()> {
-        let Some(menu_index) = self.menus.iter().position(|menu| menu.is_active()) else {
-            // No menu to answer to, so nothing can still be owed.
-            self.deferred_menu_completion = None;
-            return Ok(());
+    /// Asks the completer answering now about the line as it is. `asked`
+    /// when the user asked, with Tab or a menu key.
+    fn ask_completions(&mut self, asked: bool) {
+        let reply = self
+            .completion
+            .reply_for(self.editor.get_buffer(), self.editor.completion_point());
+        let request = Request {
+            line: self.editor.get_buffer(),
+            cursor: self.editor.completion_point(),
+            asked,
+            history: self.history.as_ref(),
         };
-
-        // The request that just finished was host code, which may have scrolled the
-        // terminal while it ran in the background — after the keystroke that
-        // dispatched it had already re-verified the anchor. `update_values` below
-        // can also dispatch another request for a line that moved on. Either way
-        // the repaint at the end of this settle must not trust the cached row.
-        invalidate_anchor_if_host_completer_runs(&self.menus[menu_index], &mut self.painter);
-
-        let menu = &mut self.menus[menu_index];
-        // The request this menu was waiting on finished, so repopulate it.
-        menu.update_values(
-            &mut self.editor,
-            self.completer.as_mut(),
-            self.history.as_ref(),
-        );
-        let still_provisional = menu.results_are_provisional();
-
-        let owed = self
-            .deferred_menu_completion
-            .as_ref()
-            .is_some_and(|deferred| deferred.still_applies(menu, &self.editor));
-
-        // Values were just refreshed above, so the menu must not re-fetch them.
-        let accept_lone_value =
-            owed && !still_provisional && self.decide_menu_completion(menu_index, true);
-
-        // Spent once a final answer had its say, so it cannot act on a later one.
-        // Provisional results decided nothing, so the arm outlives them.
-        if !still_provisional {
-            self.deferred_menu_completion = None;
+        let own = self
+            .completion
+            .menu
+            .and_then(|index| self.menus.get_mut(index))
+            .and_then(|menu| menu.completer.as_deref_mut());
+        match own {
+            Some(completer) => completer.complete(request, reply),
+            None => self.completer.complete(request, reply),
         }
-
-        if accept_lone_value {
-            // With a menu active this replaces in the buffer and deactivates, rather than
-            // submitting the line.
-            self.handle_editor_event(prompt, ReedlineEvent::Enter)?;
-        }
-
-        // One paint for every outcome, since painting the menu and then the accepted or
-        // extended line would flicker on each completion.
-        self.repaint(prompt)
+        self.land_completions();
     }
 
-    /// The completion an opening menu applies to the line: a lone suggestion is accepted
-    /// outright, otherwise the prefix the suggestions share is spliced in. Returns whether
-    /// the caller should accept that lone suggestion.
-    ///
-    /// Both the [`Menu`](ReedlineEvent::Menu) event and the deferred replay in
-    /// [`settle_completions`](Self::settle_completions) decide this, and they have to
-    /// decide it identically. `values_updated` says whether the caller already refreshed
-    /// the menu's values, so they are not fetched twice.
-    fn decide_menu_completion(&mut self, menu_index: usize, values_updated: bool) -> bool {
-        let menu = &mut self.menus[menu_index];
-
-        let accept_lone_value = if self.quick_completions && menu.can_quick_complete() {
-            if !values_updated {
-                menu.update_values(
-                    &mut self.editor,
-                    self.completer.as_mut(),
-                    self.history.as_ref(),
-                );
-            }
-            // Accepting a lone *stale* value is refused downstream, since its span
-            // belongs to another line, so the menu would close over a completion that
-            // never happened.
-            menu.get_values().len() == 1 && !menu.results_are_provisional()
-        } else {
-            false
+    /// Takes in completions or a preview that arrived, and does the Tab owed
+    /// to them. Returns whether anything arrived.
+    fn land_completions(&mut self) -> bool {
+        let previewed = self.completion.land_preview();
+        let Some(owed_tab) = self.completion.land(self.editor.get_buffer()) else {
+            return previewed;
         };
-
-        if !accept_lone_value && self.partial_completions {
-            menu.can_partially_complete(
-                values_updated || self.quick_completions,
-                &mut self.editor,
-                self.completer.as_mut(),
-                self.history.as_ref(),
-            );
+        if owed_tab {
+            self.complete_tab();
         }
+        true
+    }
 
-        accept_lone_value
+    /// What Tab does with the suggestions shown: take a lone one, type what
+    /// several share, or select the first.
+    fn complete_tab(&mut self) {
+        let tab = self.completion.tab(&self.editor);
+        self.completion.settle_owed();
+        match tab {
+            Tab::Nothing => {}
+            Tab::Accept => {
+                self.completion.accept_lone(&mut self.editor);
+                self.after_accept();
+            }
+            Tab::Prefix(lead) => {
+                self.completion.type_prefix(&lead, &mut self.editor);
+                self.completion.mark_line(&self.editor);
+                self.ask_completions(true);
+            }
+            Tab::Select => self.step_completion(1),
+        }
+    }
+
+    /// Moves the highlight by `steps` and keeps the preview in step.
+    fn step_completion(&mut self, steps: isize) {
+        self.completion.step(steps);
+        self.ask_preview();
+    }
+
+    /// After a suggestion was taken, shows what may follow it, while
+    /// completions show as the line is typed.
+    fn after_accept(&mut self) {
+        self.note_spaced();
+        self.completion.mark_line(&self.editor);
+        if self.completion.wants_answers() {
+            self.ask_completions(false);
+        }
+    }
+
+    /// Asks for the preview of the highlighted suggestion, while previews are
+    /// on, at the width the panel has room for. Returns whether it arrived at
+    /// once.
+    fn ask_preview(&mut self) -> bool {
+        let (Some(index), Some(shown)) = (
+            self.completion.previewed(),
+            self.completion.shown().cloned(),
+        ) else {
+            return false;
+        };
+        let reply = self.completion.previews.ask();
+        let view = room_view(
+            &shown,
+            self.completion.selected(),
+            self.panel_anchor,
+            self.painter.screen_width(),
+            self.panel_rows,
+        );
+        let width = self.panel.preview_room(&view).clamp(1, PREVIEW_WIDTH);
+        self.preview_asked = width;
+        let own = self
+            .completion
+            .menu
+            .and_then(|index| self.menus.get_mut(index))
+            .and_then(|menu| menu.completer.as_deref_mut());
+        match own {
+            Some(completer) => completer.preview(&shown, index, width, reply),
+            None => self.completer.preview(&shown, index, width, reply),
+        }
+        self.completion.land_preview()
+    }
+
+    /// Notes whether the editor is in a normal mode, where a suggestion would
+    /// insert nothing: completion shows nothing there, and the panel shows the
+    /// preview of the token under the cursor instead.
+    fn follow_mode(&mut self) {
+        let normal = matches!(
+            self.edit_mode.edit_mode(),
+            PromptEditMode::Vi(PromptViMode::Normal | PromptViMode::Visual)
+                | PromptEditMode::Helix(PromptHelixMode::Normal | PromptHelixMode::Select)
+        );
+        self.completion.set_normal(normal);
+    }
+
+    /// In a normal mode, asks the completer for the preview of the token under
+    /// the cursor, once the cursor, the line or the room for it changed.
+    /// Called on each paint, so a run of motions in one batch asks once, and
+    /// an answer for a place the cursor has left is dropped when it lands.
+    /// Returns whether the preview arrived at once.
+    fn ask_hover(&mut self) -> bool {
+        // A menu opened by a key has the panel, and its own preview.
+        if !self.completion.is_normal() || !self.hints_active() || self.completion.is_open() {
+            self.completion.stop_hovering();
+            return false;
+        }
+        let none = Completions::default();
+        let view = room_view(&none, None, 0, self.painter.screen_width(), self.panel_rows);
+        let width = self.panel.preview_room(&view).clamp(1, PREVIEW_WIDTH);
+        let line = self.editor.get_buffer();
+        let cursor = self.editor.insertion_point();
+        let Some(reply) = self.completion.hover(line, cursor, width) else {
+            return false;
+        };
+        self.completer.hover(line, cursor, width, reply);
+        self.completion.land_preview()
+    }
+
+    /// Keeps completion in step with an edit the user made: what changed the
+    /// line from `before` was not completion itself.
+    fn follow_edit(&mut self, before: &(String, usize)) {
+        let line = self.editor.get_buffer();
+        let cursor = self.editor.insertion_point();
+        if (line, cursor) == (before.0.as_str(), before.1) || self.completion.made(line, cursor) {
+            return;
+        }
+        if self.input_mode == InputMode::HistoryTraversal {
+            self.completion.close();
+            return;
+        }
+        // The hover preview follows the cursor when the next paint asks for it.
+        if self.completion.is_normal() {
+            return;
+        }
+        // Moving about the line asks for nothing: what is offered follows what is typed, and a
+        // list for wherever the cursor lands would only be in the way.
+        if line == before.0 {
+            self.completion.close();
+            return;
+        }
+        self.completion.release_selection();
+        self.completion.note_edit(line, cursor);
+        if self.completion.wants_answers() {
+            // What is shown fits the new line until its answer lands.
+            self.completion.narrow(line, cursor);
+            self.ask_completions(false);
+        }
+    }
+
+    /// The editor drawing nowhere, on a screen `width` columns wide and `height` rows tall: for
+    /// tests and harnesses that drive it with [`Reedline::feed`] instead of a terminal.
+    #[must_use]
+    pub fn headless(mut self, width: u16, height: u16) -> Self {
+        self.painter.headless(width, height);
+        self
+    }
+
+    /// Feeds `events` as one batch of terminal input, as the read loop does, after landing what
+    /// background completers have answered. `Break` holds the signal once a line is done.
+    pub fn feed(&mut self, prompt: &dyn Prompt, events: Vec<Event>) -> Result<ControlFlow<Signal>> {
+        if self.land_completions() {
+            self.repaint(prompt)?;
+        }
+        self.process_input_batch(prompt, events)
+    }
+
+    /// Waits up to `timeout` for the answer to the last completion request, lands it and paints,
+    /// as the read loop does when a background completer wakes it.
+    pub fn settle(&mut self, prompt: &dyn Prompt, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.completion.awaiting() && std::time::Instant::now() < deadline {
+            if self.land_completions() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.land_completions();
+        self.repaint(prompt)
     }
 
     fn process_input_batch(
@@ -1667,7 +1845,9 @@ impl Reedline {
     ) -> Result<ControlFlow<Signal>> {
         // Convert `Event` into `ReedlineEvent`. Also, fuse consecutive
         // `ReedlineEvent::EditCommand` into one. Also, if there're multiple
-        // `ReedlineEvent::Resize`, only keep the last one.
+        // `ReedlineEvent::Resize`, only keep one, at the place of the first and with the size of
+        // the last: events after it see the screen as resized, and none is judged by a layout
+        // that is gone.
         let mut reedline_events: Vec<ReedlineEvent> = vec![];
         // A detected paste burst is handled as ONE unit, bypassing the per-event
         // parse below. Routing each pasted char through `parse_event` is fragile:
@@ -1688,7 +1868,8 @@ impl Reedline {
             .is_some_and(|h| h.is_burst_active());
         // A resize is kept whichever arm parses the batch: the burst drain
         // pushes every event it reads, so a resize arriving mid-paste lands in
-        // the burst batch too and must not be swallowed there.
+        // the burst batch too and must not be swallowed there. A burst only
+        // inserts text, so its resize follows the insert.
         let mut resize = None;
         if burst_batch {
             let mut coalesced = String::new();
@@ -1737,6 +1918,8 @@ impl Reedline {
             }
         } else {
             let mut edits = vec![];
+            // Where the batch's resize is among `reedline_events`, once there is one.
+            let mut resize_at: Option<usize> = None;
             for event in events {
                 // Reclassify a newline key (bare `Enter`, or `Ctrl-J` for a raw
                 // LF) that the oracle judges paste-embedded into a newline even
@@ -1755,7 +1938,18 @@ impl Reedline {
                 if let Ok(event) = ReedlineRawEvent::try_from(event) {
                     match self.edit_mode.parse_event(event) {
                         ReedlineEvent::Edit(edit) => edits.extend(edit),
-                        ReedlineEvent::Resize(x, y) => resize = Some((x, y)),
+                        ReedlineEvent::Resize(x, y) => match resize_at {
+                            // Later sizes replace the first, which keeps its place.
+                            Some(at) => reedline_events[at] = ReedlineEvent::Resize(x, y),
+                            None => {
+                                if !edits.is_empty() {
+                                    reedline_events
+                                        .push(ReedlineEvent::Edit(std::mem::take(&mut edits)));
+                                }
+                                resize_at = Some(reedline_events.len());
+                                reedline_events.push(ReedlineEvent::Resize(x, y));
+                            }
+                        },
                         event => {
                             if !edits.is_empty() {
                                 reedline_events
@@ -1838,10 +2032,18 @@ impl Reedline {
 
     fn handle_event(&mut self, prompt: &dyn Prompt, event: ReedlineEvent) -> Result<EventStatus> {
         if self.input_mode == InputMode::HistorySearch {
-            self.handle_history_search_event(event)
-        } else {
-            self.handle_editor_event(prompt, event)
+            return self.handle_history_search_event(event);
         }
+        self.follow_mode();
+        let before = (
+            self.editor.get_buffer().to_owned(),
+            self.editor.insertion_point(),
+        );
+        let status = self.handle_editor_event(prompt, event)?;
+        if matches!(status, EventStatus::Handled) {
+            self.follow_edit(&before);
+        }
+        Ok(status)
     }
 
     fn handle_history_search_event(&mut self, event: ReedlineEvent) -> io::Result<EventStatus> {
@@ -1876,7 +2078,7 @@ impl Reedline {
                 // The line from before the search, not the search query. It is
                 // abandoned like any other, so the next read starts empty.
                 let buffer = self.editor.get_buffer().to_string();
-                self.run_edit_commands(&[EditCommand::Clear]);
+                self.run_edit_commands_with_status(&[EditCommand::Clear]);
                 self.editor.reset_undo_stack();
                 Ok(EventStatus::Exits(Signal::CtrlC(buffer)))
             }
@@ -1914,10 +2116,12 @@ impl Reedline {
                 row,
                 button,
             } => {
-                if button == MouseButton::Left {
-                    self.handle_mouse_click(column, row)?;
-                }
-                Ok(EventStatus::Handled)
+                // A turn that moved nothing, as at the end of a list, leaves the screen as it is.
+                Ok(if self.handle_mouse(column, row, button)? {
+                    EventStatus::Handled
+                } else {
+                    EventStatus::Inapplicable
+                })
             }
             ReedlineEvent::Resize(width, height) => {
                 self.last_render_snapshot = None;
@@ -1965,6 +2169,9 @@ impl Reedline {
             | ReedlineEvent::MenuRight
             | ReedlineEvent::MenuPageNext
             | ReedlineEvent::MenuPagePrevious
+            | ReedlineEvent::MenuPreview
+            | ReedlineEvent::PreviewUp
+            | ReedlineEvent::PreviewDown
             | ReedlineEvent::SwitchMode(_) => Ok(EventStatus::Inapplicable),
         }
     }
@@ -1976,150 +2183,134 @@ impl Reedline {
     ) -> io::Result<EventStatus> {
         match event {
             ReedlineEvent::Menu(name) => {
-                if self.active_menu().is_none() {
-                    if let Some(index) = self.menus.iter().position(|menu| menu.name() == name) {
-                        self.menus[index].menu_event(MenuEvent::Activate(self.quick_completions));
-                        invalidate_anchor_if_host_completer_runs(
-                            &self.menus[index],
-                            &mut self.painter,
-                        );
-
-                        if self.decide_menu_completion(index, false) {
-                            return self.handle_editor_event(prompt, ReedlineEvent::Enter);
-                        }
-
-                        // A final answer already had its say above, so only a
-                        // provisional one leaves anything owed. With neither option set
-                        // nothing queried the completer, so this reads the default
-                        // `false` and the menu paints as it always has.
-                        if self.menus[index].results_are_provisional() {
-                            self.deferred_menu_completion = Some(DeferredMenuCompletion::new(
-                                &self.menus[index],
-                                &self.editor,
-                            ));
-                        }
-
-                        return Ok(EventStatus::Handled);
-                    }
+                // Only a menu there is takes the pick: a binding may name one that is not, as
+                // Enter's `[Menu("abbr_menu"), Enter]` does, and go on to submit.
+                let Some(index) = self.menus.iter().position(|menu| menu.name() == name) else {
+                    return Ok(EventStatus::Inapplicable);
+                };
+                if self.take_pick() {
+                    return Ok(EventStatus::Handled);
                 }
-                Ok(EventStatus::Inapplicable)
+                if self.completion.is_selecting() {
+                    return Ok(EventStatus::Inapplicable);
+                }
+                let own = self.menus[index].completer.is_some();
+                self.completion.open(Some(index), own);
+                self.ask_completions(true);
+                if self.completion.awaiting() {
+                    self.completion.owe_tab();
+                } else {
+                    self.complete_tab();
+                }
+                Ok(EventStatus::Handled)
             }
             ReedlineEvent::MenuAccept => {
-                // Where a menu's claim on a keypress is decided, for the submit
-                // events that offer it one as much as for a binding that wants
-                // the accept alone. A menu declines the keypress unless it can
-                // splice something: with no suggestions there is nothing to
-                // take, and a *stale* value is refused downstream because its
-                // span belongs to another line, so accepting one would close
-                // the menu over a completion that never happened. Declining
-                // leaves the key to reach the line instead of appearing dead.
-                match self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    Some(menu)
-                        if !menu.get_values().is_empty() && !menu.results_are_provisional() =>
-                    {
-                        menu.replace_in_buffer(&mut self.editor);
-                        menu.menu_event(MenuEvent::Deactivate);
-                        Ok(EventStatus::Handled)
-                    }
-                    _ => Ok(EventStatus::Inapplicable),
-                }
-            }
-            ReedlineEvent::MenuNext => {
-                if let Some(menu) = self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    // The second route to the lone-value accept, so it carries the same
-                    // provisional guard as `decide_menu_completion`: accepting a lone
-                    // *stale* value is refused downstream, but the `Enter` would still
-                    // deactivate the menu, closing it over a completion that never
-                    // happened.
-                    if menu.get_values().len() == 1
-                        && menu.can_quick_complete()
-                        && !menu.results_are_provisional()
-                    {
-                        self.handle_editor_event(prompt, ReedlineEvent::Enter)
-                    } else {
-                        if self.partial_completions {
-                            menu.can_partially_complete(
-                                self.quick_completions,
-                                &mut self.editor,
-                                self.completer.as_mut(),
-                                self.history.as_ref(),
-                            );
-                            invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                        }
-                        menu.menu_event(MenuEvent::NextElement);
-                        Ok(EventStatus::Handled)
-                    }
+                // A selection is taken, keeping the line open; with none the
+                // key goes on to submit or insert as it would.
+                if self.completion.accept(&mut self.editor, true) {
+                    self.after_accept();
+                    Ok(EventStatus::Handled)
                 } else {
                     Ok(EventStatus::Inapplicable)
                 }
             }
-            ReedlineEvent::MenuPrevious => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::PreviousElement);
-                        Ok(EventStatus::Handled)
-                    })
+            ReedlineEvent::MenuNext | ReedlineEvent::MenuPrevious
+                if self.completion.is_selecting() || self.completion.is_open() =>
+            {
+                let steps = if event == ReedlineEvent::MenuNext {
+                    1
+                } else {
+                    -1
+                };
+                self.step_completion(steps);
+                Ok(EventStatus::Handled)
             }
-            ReedlineEvent::MenuUp => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveUp);
-                        Ok(EventStatus::Handled)
-                    })
+            ReedlineEvent::MenuUp | ReedlineEvent::MenuDown if self.completion.is_selecting() => {
+                let steps = if event == ReedlineEvent::MenuDown {
+                    1
+                } else {
+                    -1
+                };
+                self.step_completion(steps);
+                Ok(EventStatus::Handled)
             }
-            ReedlineEvent::MenuDown => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveDown);
-                        Ok(EventStatus::Handled)
-                    })
+            ReedlineEvent::MenuPageNext | ReedlineEvent::MenuPagePrevious
+                if self.completion.is_selecting() =>
+            {
+                let page = isize::try_from(self.list_room.max(1)).unwrap_or(isize::MAX);
+                let steps = if event == ReedlineEvent::MenuPageNext {
+                    page
+                } else {
+                    -page
+                };
+                self.completion.page(steps);
+                self.ask_preview();
+                Ok(EventStatus::Handled)
             }
-            ReedlineEvent::MenuLeft => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveLeft);
-                        Ok(EventStatus::Handled)
-                    })
-            }
-            ReedlineEvent::MenuRight => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveRight);
-                        Ok(EventStatus::Handled)
-                    })
-            }
-            // These two spell out `active_menu()`, since that borrows all of `self` and
-            // the painter has to stay reachable alongside the menu.
-            ReedlineEvent::MenuPageNext => {
-                match self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    Some(menu) => {
-                        menu.menu_event(MenuEvent::NextPage);
-                        invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                        Ok(EventStatus::Handled)
+            ReedlineEvent::MenuPreview
+                if self.completion.is_open() || self.completion.is_hovering() =>
+            {
+                if self.completion.cycle_preview() {
+                    if self.completion.is_hovering() {
+                        self.completion.rehover();
+                    } else {
+                        self.ask_preview();
                     }
-                    None => Ok(EventStatus::Inapplicable),
                 }
+                Ok(EventStatus::Handled)
             }
-            ReedlineEvent::MenuPagePrevious => {
-                match self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    Some(menu) => {
-                        menu.menu_event(MenuEvent::PreviousPage);
-                        invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                        Ok(EventStatus::Handled)
-                    }
-                    None => Ok(EventStatus::Inapplicable),
+            ReedlineEvent::PreviewUp | ReedlineEvent::PreviewDown
+                if self.completion.preview().is_some() =>
+            {
+                let room = usize::from(self.preview_rows);
+                self.completion
+                    .step_preview(event == ReedlineEvent::PreviewDown, room);
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::MenuNext
+            | ReedlineEvent::MenuPrevious
+            | ReedlineEvent::MenuUp
+            | ReedlineEvent::MenuDown
+            | ReedlineEvent::MenuLeft
+            | ReedlineEvent::MenuRight
+            | ReedlineEvent::MenuPageNext
+            | ReedlineEvent::MenuPagePrevious
+            | ReedlineEvent::MenuPreview
+            | ReedlineEvent::PreviewUp
+            | ReedlineEvent::PreviewDown => Ok(EventStatus::Inapplicable),
+            ReedlineEvent::HistoryHintComplete => {
+                // With no history hint, the hint key takes the lone suggestion
+                // drawn in its place.
+                let history_hint = self.hints_active()
+                    && self
+                        .hinter
+                        .as_ref()
+                        .is_some_and(|hinter| !hinter.complete_hint().is_empty());
+                if !history_hint && self.completion.lone(&self.editor).is_some() {
+                    self.completion.accept_lone(&mut self.editor);
+                    self.after_accept();
+                    return Ok(EventStatus::Handled);
                 }
+                Ok(self.accept_history_hint(true))
             }
-            ReedlineEvent::HistoryHintComplete => Ok(self.accept_history_hint(true)),
             ReedlineEvent::HistoryHintWordComplete => Ok(self.accept_history_hint(false)),
             ReedlineEvent::Esc => {
-                // Nothing to cancel is reported as such, so a binding like
-                // `UntilFound([Esc, ExecuteHostCommand(..)])` can fall through.
-                let had_menu = self.active_menu().is_some();
+                // Esc drops the highlight first, then hides the
+                // suggestions; nothing to cancel is reported as such, so a
+                // binding like `UntilFound([Esc, ExecuteHostCommand(..)])`
+                // can fall through.
+                if self.completion.unhighlight() {
+                    return Ok(EventStatus::Handled);
+                }
+                let had_completions = self.completion.is_open();
+                let had_hover = self.completion.hide_hover();
                 let had_selection = self.editor.cursor_is_a_selection();
-                self.deactivate_menus();
+                // A normal mode has no suggestions to hide for the word it is in.
+                if had_completions || !self.completion.is_normal() {
+                    self.completion.dismiss();
+                }
                 self.editor.clear_selection();
-                Ok(if had_menu || had_selection {
+                Ok(if had_completions || had_hover || had_selection {
                     EventStatus::Handled
                 } else {
                     EventStatus::Inapplicable
@@ -2130,24 +2321,24 @@ impl Reedline {
                     self.editor.reset_undo_stack();
                     Ok(EventStatus::Exits(Signal::CtrlD))
                 } else {
-                    self.run_edit_commands(&[EditCommand::Delete]);
+                    self.run_edit_commands_with_status(&[EditCommand::Delete]);
                     Ok(EventStatus::Handled)
                 }
             }
             ReedlineEvent::CtrlC => {
-                self.deactivate_menus();
+                self.completion.close();
                 let buffer = self.editor.get_buffer().to_string();
-                self.run_edit_commands(&[EditCommand::Clear]);
+                self.run_edit_commands_with_status(&[EditCommand::Clear]);
                 self.editor.reset_undo_stack();
                 Ok(EventStatus::Exits(Signal::CtrlC(buffer)))
             }
             ReedlineEvent::ClearScreen => {
-                self.deactivate_menus();
+                self.completion.close();
                 self.painter.clear_screen()?;
                 Ok(EventStatus::Handled)
             }
             ReedlineEvent::ClearScrollback => {
-                self.deactivate_menus();
+                self.completion.close();
                 self.painter.clear_scrollback()?;
                 Ok(EventStatus::Handled)
             }
@@ -2167,7 +2358,7 @@ impl Reedline {
                 match self.validator.as_mut().map(|v| v.validate(&buffer)) {
                     None | Some(ValidationResult::Complete) => Ok(self.submit_buffer(prompt)?),
                     Some(ValidationResult::Incomplete) => {
-                        self.run_edit_commands(&[EditCommand::InsertNewline]);
+                        self.run_edit_commands_with_status(&[EditCommand::InsertNewline]);
 
                         Ok(EventStatus::Handled)
                     }
@@ -2202,13 +2393,13 @@ impl Reedline {
                 let cursor_position_in_buffer = self.editor.insertion_point();
                 let buffer = self.editor.get_buffer().to_string();
                 if cursor_position_in_buffer < buffer.len() {
-                    self.run_edit_commands(&[EditCommand::InsertNewline]);
+                    self.run_edit_commands_with_status(&[EditCommand::InsertNewline]);
                     return Ok(EventStatus::Handled);
                 }
                 match self.validator.as_mut().map(|v| v.validate(&buffer)) {
                     None | Some(ValidationResult::Complete) => Ok(self.submit_buffer(prompt)?),
                     Some(ValidationResult::Incomplete) => {
-                        self.run_edit_commands(&[EditCommand::InsertNewline]);
+                        self.run_edit_commands_with_status(&[EditCommand::InsertNewline]);
 
                         Ok(EventStatus::Handled)
                     }
@@ -2242,14 +2433,38 @@ impl Reedline {
                     _ => commands,
                 };
 
-                let status = self.run_edit_commands_with_status(&commands);
-
-                // Ahead of everything below, which would otherwise ask a
-                // completer about a word the user has already left, or return
-                // through the abbreviation expansion without ever looking.
-                if status == EditCommandStatus::Applied {
-                    self.close_a_menu_past_its_word(&commands);
+                // A Tab bound as an edit opens completion as `Menu` does.
+                if let [EditCommand::Complete] = commands.as_slice() {
+                    if self.take_pick() {
+                        return Ok(EventStatus::Handled);
+                    }
+                    self.completion.open(None, false);
+                    self.ask_completions(true);
+                    if self.completion.awaiting() {
+                        self.completion.owe_tab();
+                    } else {
+                        self.complete_tab();
+                    }
+                    return Ok(EventStatus::Handled);
                 }
+
+                // A space typed where the editor has just put one goes over it.
+                let spaced = self.spaced.take();
+                if matches!(commands.as_slice(), [EditCommand::InsertChar(' ')])
+                    && spaced.is_some_and(|(line, at)| {
+                        line == self.editor.get_buffer() && at == self.editor.insertion_point()
+                    })
+                {
+                    return Ok(EventStatus::Handled);
+                }
+
+                // What the line was made to go on with stays only if the next key goes along.
+                let commands = match self.withdraw_opening(commands) {
+                    Some(commands) => commands,
+                    None => return Ok(EventStatus::Handled),
+                };
+
+                let status = self.run_edit_commands_with_status(&commands);
 
                 // Check if a space was just inserted and try to expand abbreviations
                 if status == EditCommandStatus::Applied
@@ -2259,54 +2474,10 @@ impl Reedline {
                         return self.handle_editor_event(prompt, event);
                     }
                 }
-
-                if let Some(menu) = self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    let quick_complete = self.quick_completions && menu.can_quick_complete();
-                    // Dismissing a menu handles the event even when the cursor didn't move.
-                    if quick_complete
-                        && !self.persistent_menus
-                        && matches!(
-                            commands.first(),
-                            Some(EditCommand::Backspace)
-                                | Some(EditCommand::BackspaceWord)
-                                | Some(EditCommand::MoveToLineStart { select: false })
-                        )
-                    {
-                        menu.menu_event(MenuEvent::Deactivate);
-                        return Ok(EventStatus::Handled);
-                    }
-                    if status == EditCommandStatus::Inapplicable {
-                        return Ok(EventStatus::Inapplicable);
-                    }
-                    if quick_complete {
-                        menu.menu_event(MenuEvent::Edit(self.quick_completions));
-                        invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                        menu.update_values(
-                            &mut self.editor,
-                            self.completer.as_mut(),
-                            self.history.as_ref(),
-                        );
-                        if let Some(&EditCommand::Complete) = commands.first() {
-                            if menu.get_values().len() == 1 {
-                                return self.handle_editor_event(prompt, ReedlineEvent::Enter);
-                            } else if self.partial_completions
-                                && menu.can_partially_complete(
-                                    self.quick_completions,
-                                    &mut self.editor,
-                                    self.completer.as_mut(),
-                                    self.history.as_ref(),
-                                )
-                            {
-                                return Ok(EventStatus::Handled);
-                            }
-                        }
-                    }
-                    if !self.persistent_menus && self.editor.line_buffer().get_buffer().is_empty() {
-                        menu.menu_event(MenuEvent::Deactivate);
-                    } else {
-                        menu.menu_event(MenuEvent::Edit(self.quick_completions));
-                        invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                    }
+                if status == EditCommandStatus::Applied
+                    && matches!(commands.last(), Some(EditCommand::InsertChar(' ')))
+                {
+                    self.open_what_must_follow();
                 }
                 Ok(status.into())
             }
@@ -2404,10 +2575,12 @@ impl Reedline {
                 row,
                 button,
             } => {
-                if button == MouseButton::Left {
-                    self.handle_mouse_click(column, row)?;
-                }
-                Ok(EventStatus::Handled)
+                // A turn that moved nothing, as at the end of a list, leaves the screen as it is.
+                Ok(if self.handle_mouse(column, row, button)? {
+                    EventStatus::Handled
+                } else {
+                    EventStatus::Inapplicable
+                })
             }
             ReedlineEvent::None => Ok(EventStatus::Inapplicable),
         }
@@ -2469,31 +2642,240 @@ impl Reedline {
         status
     }
 
-    fn handle_mouse_click(&mut self, column: u16, row: u16) -> Result<()> {
-        let snapshot = match &self.last_render_snapshot {
-            Some(snapshot) => snapshot,
-            None => return Ok(()),
+    /// A mouse press or wheel turn at screen (`column`, `row`).
+    ///
+    /// Over the panel a click selects, takes, folds or acts on what it hits,
+    /// and the wheel moves the highlight. A click outside the rows of the panel
+    /// closes it and then goes on to place the cursor, where that is enabled;
+    /// one on a blank cell inside them does nothing. While a panel is open the
+    /// wheel always belongs to it, wherever the pointer is, so it never scrolls
+    /// the terminal behind it: the region of the panel under the pointer, its
+    /// frame and blank cells included, decides whether it scrolls the preview
+    /// or moves the highlight, and anywhere off the panel it is the highlight's.
+    ///
+    /// A press first checks that the rows the panel is believed to be on are the
+    /// ones it is on, which costs a query of the terminal that a wheel turn is
+    /// spared.
+    ///
+    /// Returns whether anything changed, so that a turn of the wheel at the end
+    /// of the list does not repaint.
+    fn handle_mouse(&mut self, column: u16, row: u16, button: MouseButton) -> Result<bool> {
+        if !matches!(
+            button,
+            MouseButton::Left | MouseButton::ScrollUp | MouseButton::ScrollDown
+        ) {
+            return Ok(false);
+        }
+        let Some(snapshot) = self.last_render_snapshot.take() else {
+            return Ok(false);
         };
         if self.input_mode != InputMode::Regular {
-            return Ok(());
+            self.last_render_snapshot = Some(snapshot);
+            return Ok(false);
         }
 
-        // Try to select the entry under the pointer if a menu is active
-        if snapshot.menu_active {
-            let Some(menu_start_row) = snapshot.menu_start_row else {
-                return Ok(());
+        if button == MouseButton::Left {
+            self.painter.verify_origin();
+        }
+        let panel = Painter::menu_rows(&snapshot);
+        let panel_row = panel.as_ref().and_then(|rows| {
+            let row = self.painter.frame_row(row)?.checked_sub(rows.start)?;
+            (row < rows.end - rows.start).then_some(row)
+        });
+        let hit = panel_row.and_then(|row| self.panel.hit_at(row, column));
+        self.last_render_snapshot = Some(snapshot.clone());
+        // Over the preview of the token under the cursor there is no list, and
+        // the wheel only scrolls.
+        let hovering = self.completion.is_hovering() && panel_row.is_some();
+        if button != MouseButton::Left {
+            let down = button == MouseButton::ScrollDown;
+            let region = if hovering {
+                Some(Region::Preview)
+            } else {
+                panel_row.and_then(|row| self.panel.region_at(row, column))
             };
-            let Some(menu_row) = row.checked_sub(menu_start_row) else {
-                return Ok(());
-            };
-            let terminal_columns = snapshot.screen_width;
-            let available_lines = snapshot.screen_height.saturating_sub(menu_start_row);
-            self.accept_menu_click(column, menu_row, terminal_columns, available_lines);
-            return Ok(());
+            return Ok(match region {
+                // Over the preview, its frame included, the wheel scrolls it, and anywhere else
+                // on the panel, or beside it, it moves the selection.
+                Some(Region::Preview) => self.scroll_preview_by_wheel(down),
+                _ if panel.is_some() => {
+                    let moved = self.completion.scroll(down);
+                    // The preview of where the highlight ended is asked for at the repaint.
+                    self.preview_pending |= moved;
+                    moved
+                }
+                _ => false,
+            });
         }
 
+        match hit {
+            Some(hit) => self.click_panel(hit),
+            // A blank cell among the rows of the panel is part of it, and a click there is
+            // nothing.
+            None if panel_row.is_some() && !hovering => {}
+            None => {
+                if hovering {
+                    self.completion.hide_hover();
+                } else if panel.is_some() {
+                    // Not on the panel: that closes it, and the click goes on.
+                    self.completion.dismiss();
+                }
+                if self.mouse_click_mode.is_enabled() {
+                    self.place_cursor(&snapshot, column, row);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Scrolls the preview a turn of the wheel's worth, down or up: a fraction of its height,
+    /// as a long preview moves faster than a short one. Returns whether it moved.
+    fn scroll_preview_by_wheel(&mut self, down: bool) -> bool {
+        let step = isize::try_from((self.preview_rows / WHEEL_FRACTION).max(1)).unwrap_or(1);
+        let rows = if down { step } else { -step };
+        self.completion
+            .scroll_preview(rows, usize::from(self.preview_rows))
+    }
+
+    /// What clicking `hit` in the panel does. A click on an item selects it, and a second on the
+    /// same one soon after takes it, so that the highlight the wheel or the keys left on a row
+    /// does not take it at the first click.
+    fn click_panel(&mut self, hit: Hit) {
+        match hit {
+            Hit::Item(index) => {
+                let again = self
+                    .last_item_click
+                    .take()
+                    .is_some_and(|(at, last)| last == index && at.elapsed() < DOUBLE_CLICK);
+                if again && self.completion.selected() == Some(index) {
+                    if self.completion.accept(&mut self.editor, true) {
+                        self.after_accept();
+                    }
+                } else {
+                    self.last_item_click = Some((std::time::Instant::now(), index));
+                    // Pointed at, so the list does not scroll the row from under the pointer.
+                    self.completion.point(index);
+                    self.ask_preview();
+                }
+            }
+            Hit::Fold => self.completion.toggle_fold(),
+            Hit::Preview(row) => self.click_preview(row),
+            Hit::Frame => {}
+        }
+    }
+
+    /// Takes the pick, if one is reached, as a suggestion is taken. Returns whether there was
+    /// one.
+    /// Puts in what the line can only go on with, after a space was typed, with the cursor where
+    /// the writing goes on. The next key may still take it back: see
+    /// [`withdraw_opening`](Self::withdraw_opening).
+    fn open_what_must_follow(&mut self) {
+        if self.input_mode != InputMode::Regular || self.editor.get_selection().is_some() {
+            return;
+        }
+        let at = self.editor.insertion_point();
+        let line = self.editor.get_buffer().to_owned();
+        let Some(Opening { text, cursor }) = self.completer.opening(&line, at) else {
+            return;
+        };
+        if text.is_empty() || !text.is_char_boundary(cursor.min(text.len())) {
+            return;
+        }
+        let mut buffer = self.editor.line_buffer().clone();
+        buffer.insert_str(&text);
+        buffer.set_insertion_point(at + cursor.min(text.len()));
+        self.editor
+            .set_line_buffer(buffer, UndoBehavior::CreateUndoPoint);
+        self.note_spaced();
+        self.opened = Some(Opened {
+            line: self.editor.get_buffer().to_owned(),
+            cursor: self.editor.insertion_point(),
+            at,
+            first: text.chars().next(),
+            len: text.len(),
+        });
+    }
+
+    /// Remembers the line when the editor has just left a space before the cursor.
+    fn note_spaced(&mut self) {
+        let (line, at) = (self.editor.get_buffer(), self.editor.insertion_point());
+        self.spaced = line[..at].ends_with(' ').then(|| (line.to_owned(), at));
+    }
+
+    /// `commands` as they are to run, after taking back the text
+    /// [`open_what_must_follow`](Self::open_what_must_follow) put in if they are the key that
+    /// says it was not wanted: Backspace or undo (`None`, nothing more to do), or typing what it
+    /// starts with or a flag, which go where the text was.
+    fn withdraw_opening(&mut self, commands: Vec<EditCommand>) -> Option<Vec<EditCommand>> {
+        let Some(opened) = self.opened.take() else {
+            return Some(commands);
+        };
+        if self.editor.get_buffer() != opened.line || self.editor.insertion_point() != opened.cursor
+        {
+            return Some(commands);
+        }
+        let erases = matches!(
+            commands.as_slice(),
+            [EditCommand::Backspace | EditCommand::Undo]
+        );
+        let goes_before = match commands.as_slice() {
+            [EditCommand::InsertChar(c)] => *c == '-' || Some(*c) == opened.first,
+            _ => false,
+        };
+        if !(erases || goes_before) {
+            return Some(commands);
+        }
+        let mut buffer = self.editor.line_buffer().clone();
+        buffer.replace_range(opened.at..opened.at + opened.len, "");
+        buffer.set_insertion_point(opened.at);
+        self.editor
+            .set_line_buffer(buffer, UndoBehavior::CreateUndoPoint);
+        goes_before.then_some(commands)
+    }
+
+    fn take_pick(&mut self) -> bool {
+        let taken = self.completion.accept_pick(&mut self.editor);
+        if taken {
+            self.after_accept();
+        }
+        taken
+    }
+
+    /// Lets the completer act on a click at `row` of the selected
+    /// suggestion's preview: what it answers is put into the line.
+    fn click_preview(&mut self, row: usize) {
+        // A part that can be taken is the preview's own to answer.
+        if let Some(pick) = self.completion.pick_at(row) {
+            self.completion.take(&pick.suggestion, &mut self.editor);
+            self.after_accept();
+            return;
+        }
+        let (Some(index), Some(shown)) =
+            (self.completion.selected(), self.completion.shown().cloned())
+        else {
+            return;
+        };
+        let own = self
+            .completion
+            .menu
+            .and_then(|index| self.menus.get_mut(index))
+            .and_then(|menu| menu.completer.as_deref_mut());
+        let item = match own {
+            Some(completer) => completer.preview_clicked(&shown, index, row),
+            None => self.completer.preview_clicked(&shown, index, row),
+        };
+        if let Some(item) = item {
+            self.completion.take(&item, &mut self.editor);
+            self.after_accept();
+        }
+    }
+
+    /// Moves the cursor to what is at screen (`column`, `row`) in the buffer
+    /// of the last paint.
+    fn place_cursor(&mut self, snapshot: &RenderSnapshot, column: u16, row: u16) {
+        let offset = self.painter.screen_to_buffer_offset(snapshot, column, row);
         let buffer = self.editor.get_buffer();
-        if let Some(offset) = self.painter.screen_to_buffer_offset(snapshot, column, row) {
+        if let Some(offset) = offset {
             if buffer.is_char_boundary(offset) {
                 self.editor.edit_buffer(
                     |buf| buf.set_insertion_point(offset),
@@ -2501,37 +2883,6 @@ impl Reedline {
                 );
             }
         }
-        Ok(())
-    }
-
-    fn accept_menu_click(
-        &mut self,
-        column: u16,
-        menu_row: u16,
-        terminal_columns: u16,
-        available_lines: u16,
-    ) {
-        let Some(menu) = self.menus.iter_mut().find(|menu| menu.is_visible()) else {
-            return;
-        };
-        let Some(index) = menu.selection_at(column, menu_row, terminal_columns, available_lines)
-        else {
-            return;
-        };
-
-        menu.set_selection(index);
-    }
-
-    fn active_menu(&mut self) -> Option<&mut ReedlineMenu> {
-        self.menus.iter_mut().find(|menu| menu.is_active())
-    }
-
-    fn deactivate_menus(&mut self) {
-        // Nothing is left to complete into.
-        self.deferred_menu_completion = None;
-        self.menus
-            .iter_mut()
-            .for_each(|menu| menu.menu_event(MenuEvent::Deactivate));
     }
 
     fn previous_history(&mut self) -> io::Result<()> {
@@ -2743,8 +3094,19 @@ impl Reedline {
     }
 
     /// Executes [`EditCommand`] actions by modifying the internal state appropriately. Does not output itself.
+    ///
+    /// Completion follows the change as it follows typing: what is asked of the
+    /// completer, and what is drawn, is for the line and cursor the commands
+    /// leave, also when they are run between two calls of
+    /// [`read_line`](Self::read_line), as a host does after a
+    /// [`Signal::HostCommand`].
     pub fn run_edit_commands(&mut self, commands: &[EditCommand]) {
+        let before = (
+            self.editor.get_buffer().to_owned(),
+            self.editor.insertion_point(),
+        );
         self.run_edit_commands_with_status(commands);
+        self.follow_edit(&before);
     }
 
     fn run_edit_commands_with_status(&mut self, commands: &[EditCommand]) -> EditCommandStatus {
@@ -2789,16 +3151,6 @@ impl Reedline {
 
     fn auto_pair_command(&self, command: &EditCommand) -> Option<EditCommand> {
         let auto_pairs = self.auto_pairs.as_ref()?;
-
-        // A menu in `Diff` mode reads what is typed after it opened as its
-        // query, not as code, so a pair would end up in the search.
-        let query_menu_open = self.menus.iter().any(|menu| {
-            menu.is_active()
-                && menu.settings().effective_input_mode() == crate::menu::InputMode::Diff
-        });
-        if query_menu_open {
-            return None;
-        }
 
         // Resolve which auto-pair action (if any) `command` would trigger, along
         // with the pair it acts on and the `EditCommand` that would replace it.
@@ -2944,7 +3296,7 @@ impl Reedline {
         } else {
             hinter.next_hint_token()
         };
-        if !self.hints_active() || accepted.is_empty() || self.active_menu().is_some() {
+        if !self.hints_active() || accepted.is_empty() || self.completion.is_selecting() {
             return EventStatus::Inapplicable;
         }
 
@@ -2975,7 +3327,7 @@ impl Reedline {
 
         if self.editor.is_cursor_at_buffer_end() {
             self.editor.prepare_append_at_buffer_end();
-            self.run_edit_commands(&[EditCommand::InsertString(accepted)]);
+            self.run_edit_commands_with_status(&[EditCommand::InsertString(accepted)]);
             EventStatus::Handled
         } else {
             EventStatus::Inapplicable
@@ -2999,19 +3351,34 @@ impl Reedline {
         let hinter = self.hinter.as_ref()?;
         let free = hinter.continues_text_before_cursor()
             && self.hints_active()
-            && !self.menus.iter().any(|menu| menu.is_active())
+            && !self.completion.is_selecting()
             && !self.editor.cursor_is_a_selection();
         free.then(|| self.trailing_auto_pair_closers()).flatten()
     }
 
     /// Repaint of either the buffer or the parts for reverse history search
     fn repaint(&mut self, prompt: &dyn Prompt) -> io::Result<()> {
+        // A burst of wheel turns moved the highlight many times; the preview of where it ended
+        // is asked for once, here, rather than for each turn.
+        if mem::take(&mut self.preview_pending) {
+            self.ask_preview();
+        }
         // Repainting
         if self.input_mode == InputMode::HistorySearch {
-            self.history_search_paint(prompt)
-        } else {
-            self.buffer_paint(prompt)
+            self.mouse.set(false);
+            return self.history_search_paint(prompt);
         }
+        self.buffer_paint(prompt)?;
+        // The panel may want the preview at another width than it was asked
+        // for, as when the list it flows out of changed. A preview that
+        // arrives at once is painted in the second pass.
+        let wanted = self
+            .preview_wanted
+            .filter(|&width| width != self.preview_asked);
+        if wanted.is_some() && self.ask_preview() {
+            self.buffer_paint(prompt)?;
+        }
+        Ok(())
     }
 
     /// Expands an abbreviation at the word before the cursor, if any exists
@@ -3035,8 +3402,7 @@ impl Reedline {
         // UTF-8 char sitting just before the cursor (e.g. pasted CJK text).
         // Floor it down to the nearest char boundary before slicing to avoid
         // a panic.
-        let word_end =
-            crate::menu_functions::floor_char_boundary(buffer, cursor_position_in_buffer - offset);
+        let word_end = buffer.floor_char_boundary(cursor_position_in_buffer - offset);
         let prefix = &buffer[..word_end];
         let word_start = prefix
             .char_indices()
@@ -3363,6 +3729,9 @@ impl Reedline {
     ///
     /// Includes the highlighting and hinting calls.
     fn buffer_paint(&mut self, prompt: &dyn Prompt) -> Result<()> {
+        self.follow_mode();
+        self.land_completions();
+        self.ask_hover();
         let use_ansi_coloring = self.effective_ansi_coloring();
         let cursor_position_in_buffer = self.editor.insertion_point();
         let buffer_to_paint = self.editor.get_buffer();
@@ -3370,6 +3739,18 @@ impl Reedline {
         let mut styled_text = self
             .highlighter
             .highlight(buffer_to_paint, cursor_position_in_buffer);
+        // What is wrong with the line is drawn on the parts at fault, under any selection.
+        let sign = match self.status_line.as_mut() {
+            Some(status_line) if !self.hide_hints => {
+                status_line.sign(buffer_to_paint, cursor_position_in_buffer)
+            }
+            _ => None,
+        };
+        for mark in sign.iter().flat_map(|sign| sign.marks.iter()) {
+            if let Some(sign) = &sign {
+                styled_text.style_range(mark.start, mark.end, sign.style);
+            }
+        }
         if let Some((from, to)) = self.editor.get_selection() {
             // With a cursor-cell style configured, the head cell gets it and
             // the selection style covers the rest of the range.
@@ -3463,6 +3844,81 @@ impl Reedline {
             String::new()
         };
 
+        // What taking the highlighted suggestion would write is drawn after the
+        // cursor as virtual text, in place of the history hint: the highlight is
+        // what Enter takes. With none highlighted and no history hint, the only
+        // suggestion left is drawn there instead of in a panel.
+        let selecting = self.completion.is_selecting() || self.completion.is_picking();
+        let virtual_text = if self.hints_active() {
+            self.completion.virtual_text(&self.editor)
+        } else {
+            None
+        };
+        // A correction or a fuzzy match is drawn after the cursor too, as `→ cargo`, in place of
+        // a menu of one.
+        let replacement = if self.hints_active() && !selecting && virtual_text.is_none() {
+            self.completion.lone_replacement(&self.editor)
+        } else {
+            None
+        };
+        // A suggestion that is alone is no menu, with a history hint beside it or without: the
+        // hint is the longer thing to take, and Tab still takes the suggestion.
+        let lone = (virtual_text.is_some() || replacement.is_some()) && !selecting;
+        let inline = virtual_text.filter(|_| selecting || hint.is_empty());
+        let (hint, inline) = match inline {
+            Some((rest, landing)) => {
+                let shown = ghost_text(&rest, landing);
+                let shown = if use_ansi_coloring {
+                    shown
+                } else {
+                    crate::painting::strip_ansi(&shown)
+                };
+                (String::new(), shown)
+            }
+            None if replacement.is_some() && hint.is_empty() => {
+                let text = escape_control(replacement.as_deref().unwrap_or_default());
+                let shown = if use_ansi_coloring {
+                    Style::new().dimmed().italic().paint(text).to_string()
+                } else {
+                    text.into_owned()
+                };
+                (String::new(), shown)
+            }
+            None if selecting && !hint_replaces_closers => (String::new(), String::new()),
+            None => (hint, String::new()),
+        };
+
+        // The panel is anchored under the word it completes.
+        let panel_shown = self.completion.is_open()
+            && !self.hide_hints
+            && !lone
+            && self.completion.may_draw_panel(&self.editor);
+        self.completion.note_drawn(if lone {
+            Drawn::Ghost
+        } else if panel_shown {
+            Drawn::Panel
+        } else {
+            Drawn::Nothing
+        });
+        let before_word = self
+            .completion
+            .word_start()
+            .filter(|&at| {
+                panel_shown
+                    && at <= cursor_position_in_buffer
+                    && buffer_to_paint.is_char_boundary(at)
+            })
+            .map(|at| {
+                styled_text
+                    .render_around_insertion_point(
+                        at,
+                        prompt,
+                        use_ansi_coloring,
+                        self.painter.semantic_markers(),
+                    )
+                    .0
+            });
+
         // Needs to add return carriage to newlines because when not in raw mode
         // some OS don't fully return the carriage
 
@@ -3489,28 +3945,12 @@ impl Reedline {
             )
         };
         // History search paints elsewhere, so only submit hides the status
-        // line here. Measured only with one to show, since the measure walks
-        // the whole buffer.
+        // line here.
         let screen_width = self.painter.screen_width();
-        let status_room = if self.status_line.is_some() && !self.hide_hints {
-            // An open menu hides the hint, so measure the block the painter
-            // draws above it. Active, not visible: a menu opening on this
-            // paint turns visible only in its update below. One that stays
-            // hidden gets its status line checked again by the painter.
-            let block_rows = match self.menus.iter().find(|menu| menu.is_active()) {
-                Some(menu) => lines
-                    .required_lines(screen_width, false, Some(menu))
-                    .saturating_sub(menu.menu_required_lines(screen_width)),
-                None => lines.required_lines(screen_width, false, None),
-            };
-            self.painter.status_room(block_rows)
-        } else {
-            0
-        };
-        // Not asked without a row to draw it on: it gives way to a buffer
-        // that fills the screen.
+        // While a suggestion is being walked through, the line's commentary steps aside and the
+        // panel, with the suggestion's own, sits right under the text.
         let status = match self.status_line.as_mut() {
-            Some(status_line) if status_room > 0 => status_line.status(
+            Some(status_line) if !self.hide_hints && !selecting => status_line.status(
                 buffer_to_paint,
                 cursor_position_in_buffer,
                 screen_width,
@@ -3518,62 +3958,187 @@ impl Reedline {
             ),
             _ => String::new(),
         };
-        let mut lines = lines.with_status(&status, use_ansi_coloring);
-        // Before the menus size themselves below the status line.
-        self.painter
-            .reserve_status_rows(lines.status_rows(screen_width), status_room);
-
-        // Updating the working details of the active menu
-        for menu in self.menus.iter_mut() {
-            if menu.is_active() {
-                // A menu still waiting on its first answer stays off screen, so a Tab
-                // resolving to one suggestion never draws a menu it takes away again.
-                if menu.is_visible() {
-                    lines.prompt_indicator = menu.indicator().to_owned().into();
-                }
-                // If the menu requires the cursor position, update it (ide menu)
-                let cursor_pos = lines.cursor_pos(screen_width);
-                menu.set_cursor_pos(cursor_pos);
-
-                menu.update_working_details(
-                    &mut self.editor,
-                    self.completer.as_mut(),
-                    self.history.as_ref(),
-                    &self.painter,
-                );
-
-                // That update is where a first answer lands and ends the opening phase,
-                // so ask again: the painter picks the menu to draw below, and an
-                // indicator saying otherwise would draw its rows under the ordinary
-                // prompt. Reading it twice is the price of the loop: the indicator sets
-                // the prompt width that positions the cursor, which the update consumes,
-                // so on the frame a menu opens that width lags by one paint.
-                if menu.is_visible() {
-                    lines.prompt_indicator = menu.indicator().to_owned().into();
-                }
+        // The status goes under the text it is about, when it says.
+        let status_at = match self.status_line.as_mut() {
+            Some(status_line) if !status.is_empty() => {
+                status_line.anchor(buffer_to_paint, cursor_position_in_buffer)
+            }
+            _ => None,
+        };
+        let before_status = status_at
+            .filter(|&at| buffer_to_paint.is_char_boundary(at))
+            .map(|at| {
+                styled_text
+                    .render_around_insertion_point(
+                        at,
+                        prompt,
+                        use_ansi_coloring,
+                        self.painter.semantic_markers(),
+                    )
+                    .0
+            });
+        let mut lines =
+            lines
+                .with_inline(&inline)
+                .with_status(&status, screen_width, use_ansi_coloring);
+        if let Some(before_word) = before_word {
+            lines = lines.with_before_word(before_word);
+        }
+        if let Some(before_status) = before_status {
+            lines = lines.with_before_status(before_status);
+        }
+        if let Some(sign) = &sign {
+            lines = lines.with_sign(sign, use_ansi_coloring);
+            // Its note says what the sign means, but only while the cursor is
+            // on what it is about.
+            let on_it = sign
+                .span
+                .as_ref()
+                .is_none_or(|span| (span.start..=span.end).contains(&cursor_position_in_buffer));
+            if let Some(note) = sign.note.as_deref().filter(|_| on_it) {
+                // Set off from the status, or from the edge as a status line is.
+                lines =
+                    lines.with_status_hint(&format!("  {note}"), screen_width, use_ansi_coloring);
             }
         }
+        // The panel adds to the status line, as with the description of the
+        // selected suggestion, a lone one drawn in the line included.
+        let panel_hint = self
+            .completion
+            .shown()
+            .filter(|_| {
+                (self.completion.is_open() || self.completion.has_message()) && !self.hide_hints
+            })
+            .and_then(|completions| {
+                self.panel.hint(&View {
+                    completions,
+                    selected: self.completion.selected(),
+                    anchor: 0,
+                    width: screen_width,
+                    rows: self.panel_rows,
+                    list_rows: self.panel_rows,
+                    still_rows: u16::MAX,
+                    preview: None,
+                    unfolded: false,
+                    list_offset: 0,
+                    list_scrolloff: 0,
+                    preview_offset: 0,
+                    pick: None,
+                    use_ansi_coloring,
+                })
+            });
+        if let Some(hint) = panel_hint {
+            lines = lines.with_status_hint(&hint, screen_width, use_ansi_coloring);
+        }
 
-        let menu = self.menus.iter().find(|menu| menu.is_visible());
+        // The panel shows what a Tab offers, unless a lone suggestion is
+        // already drawn in the line. In a normal mode there is no list, only
+        // the preview of the token under the cursor.
+        let preview = self.completion.preview().cloned();
+        let pick = self.completion.picked().cloned();
+        let hovering = self.completion.is_hovering() && preview.is_some() && !self.hide_hints;
+        let shown = if hovering {
+            Some(Completions::default())
+        } else {
+            panel_shown
+                .then(|| self.completion.shown().cloned())
+                .flatten()
+        };
+        let selected = self.completion.selected();
+        let unfolded = self.completion.unfolded();
+        let preview_offset = self.completion.preview_offset();
+        let (list_offset, list_scrolloff) = (
+            self.completion.list_offset(),
+            self.completion.list_scrolloff(),
+        );
+        // A preview popped out under the suggestions needs rows of its own.
+        let most_rows = if preview.is_some() {
+            if unfolded {
+                u16::MAX
+            } else {
+                self.panel_rows.saturating_mul(2)
+            }
+        } else {
+            self.panel_rows
+        };
+        let list_rows = self.panel_rows;
+        let prompt_mode = self.prompt_edit_mode();
+        let panel = &mut self.panel;
+        let panel_rows = self.panel_rows;
+        let (anchor, wanted, drawn) = (Cell::new(0), Cell::new(None), Cell::new(false));
+        let preview_rows = Cell::new(self.preview_rows);
+        let list_room = Cell::new(self.list_room);
+        let mut render = |room: Room| match &shown {
+            Some(completions) => {
+                anchor.set(room.anchor);
+                if selected.is_some() {
+                    let view =
+                        room_view(completions, selected, room.anchor, room.width, panel_rows);
+                    wanted.set(Some(panel.preview_room(&view).clamp(1, PREVIEW_WIDTH)));
+                }
+                let rows = room.rows.min(most_rows);
+                // A framed preview has two rows fewer than the panel; one without a frame
+                // scrolls the same, short of its last two rows.
+                preview_rows.set(rows.saturating_sub(2));
+                list_room.set(room.rows.min(list_rows));
+                let rows = panel.render(&View {
+                    completions,
+                    selected,
+                    anchor: room.anchor,
+                    width: room.width,
+                    rows,
+                    list_rows: room.rows.min(list_rows),
+                    still_rows: room.still,
+                    preview: preview.as_ref(),
+                    unfolded,
+                    list_offset,
+                    list_scrolloff,
+                    preview_offset,
+                    pick: pick.as_ref(),
+                    use_ansi_coloring,
+                });
+                drawn.set(!rows.is_empty());
+                rows
+            }
+            None => Vec::new(),
+        };
 
         self.painter.repaint_buffer(
             prompt,
             &lines,
-            self.prompt_edit_mode(),
-            menu,
+            prompt_mode,
+            Some(&mut render),
             use_ansi_coloring,
             &self.cursor_shapes,
         )?;
 
-        if self.mouse_click_mode.is_enabled() {
-            if let Some(layout) = &self.painter.last_layout {
-                let buffer = self.editor.get_buffer();
-                let (raw_before, raw_after) = buffer.split_at(cursor_position_in_buffer);
-                self.last_render_snapshot = Some(
-                    self.painter
-                        .render_snapshot(&lines, menu, raw_before, raw_after, layout),
-                );
-            }
+        self.panel_anchor = anchor.get();
+        self.preview_wanted = wanted.get();
+        self.preview_rows = preview_rows.get();
+        self.list_room = list_room.get();
+        // The window of the list the panel drew is where the list is scrolled to, for the next
+        // paint and for the clicks it answers.
+        if let Some(window) = self.panel.list_window().filter(|_| drawn.get()) {
+            self.completion.settle_list(window.start);
+        }
+        // The panel holds a scrolled preview back to fill its room: what it drew is where the
+        // preview is, and the room it had is how far that scrolls.
+        let window = (drawn.get() && preview.is_some())
+            .then(|| self.panel.preview_window())
+            .flatten();
+        if let Some(window) = window {
+            self.completion.settle_preview(window.start);
+            self.preview_rows = u16::try_from(window.len()).unwrap_or(u16::MAX).max(1);
+        }
+        // Clicks need to know where the panel is, and the mouse is reported
+        // only while it is on screen. Where the frame starts on the screen is found now, if a
+        // resize lost it, rather than in the middle of a flood of wheel turns.
+        self.mouse.set(drawn.get());
+        if drawn.get() || self.mouse_click_mode.is_enabled() {
+            self.painter.locate();
+        }
+        if self.mouse_click_mode.is_enabled() || drawn.get() {
+            self.last_render_snapshot = self.painter.render_snapshot(self.editor.get_buffer());
         } else {
             self.last_render_snapshot = None;
         }
@@ -3583,7 +4148,9 @@ impl Reedline {
 
     /// Adds an external printer
     pub fn with_external_printer(mut self, printer: impl ExternalOutput + 'static) -> Self {
-        self.external_printer = Some(Box::new(printer));
+        let mut printer: Box<dyn ExternalOutput> = Box::new(printer);
+        printer.attach(self.wake.clone());
+        self.external_printer = Some(printer);
         self
     }
 
@@ -3645,36 +4212,10 @@ impl Reedline {
         ))
     }
 
-    /// Close an active menu when a typed character ends the word it was opened
-    /// for. Menus without word characters, and persistent menus, live on as
-    /// they always have.
-    ///
-    /// Every command in the batch is read, not just the first: a burst of
-    /// typing arrives as one `Edit` with several `InsertChar`s, and the word
-    /// can end anywhere in it. A newline ends the word too, whether it came
-    /// as `InsertChar('\n')` or as `InsertNewline`, the command the default
-    /// `Alt+Enter` and `Shift+Enter` bindings emit.
-    fn close_a_menu_past_its_word(&mut self, commands: &[EditCommand]) {
-        if self.persistent_menus {
-            return;
-        }
-        let Some(menu) = self.menus.iter_mut().find(|menu| menu.is_active()) else {
-            return;
-        };
-        let word_ended = commands.iter().any(|command| match command {
-            EditCommand::InsertChar(c) => menu.settings().word_ends_at(*c),
-            EditCommand::InsertNewline => menu.settings().word_ends_at('\n'),
-            _ => false,
-        });
-        if word_ended {
-            menu.menu_event(MenuEvent::Deactivate);
-        }
-    }
-
     fn submit_buffer(&mut self, prompt: &dyn Prompt) -> io::Result<EventStatus> {
         // A menu that let the submit through (no suggestions to accept) must
         // not stay active into the next line's editing.
-        self.deactivate_menus();
+        self.completion.close();
         #[cfg_attr(not(feature = "system_clipboard"), allow(unused_mut))]
         let mut buffer = self.editor.get_buffer().to_string();
         // Let an installed paste interceptor replace the line at submit (e.g.
@@ -3693,7 +4234,7 @@ impl Reedline {
             .as_ref()
             .and_then(|i| i.expand_on_submit(&buffer))
         {
-            self.run_edit_commands(&[
+            self.run_edit_commands_with_status(&[
                 EditCommand::Clear,
                 EditCommand::InsertString(expanded.clone()),
             ]);
@@ -3745,11 +4286,32 @@ impl Reedline {
                 }
             }
         }
-        self.run_edit_commands(&[EditCommand::Clear]);
+        self.run_edit_commands_with_status(&[EditCommand::Clear]);
         self.editor.reset_undo_stack();
 
         Ok(EventStatus::Exits(Signal::Success(buffer)))
     }
+}
+
+/// The virtual text `rest` in its style, dim and underlined. Where taking it puts the cursor,
+/// `landing` bytes in, the underline breaks for a cell, quietly, as a gap the cursor goes in; a
+/// landing at its end or past it has no cell in the text to mark, and the text is left as it is.
+fn ghost_text(rest: &str, landing: Option<usize>) -> String {
+    let style = Style::new().dimmed().underline();
+    let split = landing
+        .filter(|&at| at < rest.len())
+        .map(|at| rest.floor_char_boundary(at));
+    let Some(at) = split else {
+        return style.paint(escape_control(rest)).to_string();
+    };
+    let (before, marked) = rest.split_at(at);
+    let cell = marked.graphemes(true).next().unwrap_or_default();
+    format!(
+        "{}{}{}",
+        style.paint(escape_control(before)),
+        Style::new().dimmed().paint(escape_control(cell)),
+        style.paint(escape_control(&marked[cell.len()..])),
+    )
 }
 
 /// Asks `highlighter` how `candidate`, a hint for the text before `cursor` in
@@ -3783,11 +4345,12 @@ mod tests {
     use super::*;
     use crate::terminal_extensions::semantic_prompt::PromptKind;
     use crate::{
-        ColumnarMenu, CompletionOrigin, CompletionResult, DefaultPrompt, Direction, FindStop,
-        ListMenu, MenuBuilder, MotionTarget, PromptHelixMode, PromptViMode, Span, Suggestion,
+        Completions, DefaultPrompt, Direction, FindStop, MotionTarget, Preview, PromptHelixMode,
+        PromptViMode, Reply, Request, Span, Suggestion,
     };
     use rstest::rstest;
     use std::path::Path;
+    use std::sync::Mutex;
 
     fn seam_engine(edit_mode: Box<dyn EditMode>) -> Reedline {
         let mut rl = Reedline::create().with_edit_mode(edit_mode);
@@ -4604,73 +5167,6 @@ mod tests {
         );
     }
 
-    /// An auto-pairing engine with a history menu open in `mode`, over the
-    /// buffer `setup` leaves behind.
-    fn auto_pair_engine_with_open_menu(mode: crate::InputMode, setup: &[EditCommand]) -> Reedline {
-        let mut rl = seam_engine(Box::<crate::Emacs>::default())
-            .with_auto_pairs(AutoPairs::new([('(', ')')]))
-            .with_menu(ReedlineMenu::HistoryMenu(Box::new(
-                ListMenu::default()
-                    .with_name("history_menu")
-                    .with_input_mode(mode),
-            )));
-        rl.history
-            .save(HistoryItem::from_command_line("(gstat).branch"))
-            .expect("history ok");
-        rl.run_edit_commands(setup);
-        rl.handle_event(
-            &DefaultPrompt::default(),
-            ReedlineEvent::Menu("history_menu".into()),
-        )
-        .expect("menu opens");
-        assert!(menu_is_active(&rl), "setup: menu is open");
-        rl
-    }
-
-    // A menu in `Diff` mode searches with what is typed after it opened, so a
-    // pair would put the closer in the query (nushell's Ctrl-R history menu).
-    // The other modes complete against the real buffer, where a pair is code.
-    #[rstest]
-    #[case::diff(crate::InputMode::Diff, "(")]
-    #[case::cursor_prefix(crate::InputMode::CursorPrefix, "()")]
-    #[case::full_buffer(crate::InputMode::FullBuffer, "()")]
-    fn auto_pairs_stay_out_of_a_query_menu(#[case] mode: crate::InputMode, #[case] expected: &str) {
-        let mut rl = auto_pair_engine_with_open_menu(mode, &[]);
-
-        drive(&mut rl, &[ch('(')]);
-
-        assert_eq!(rl.editor.get_buffer(), expected);
-    }
-
-    // Skipping a closer is an auto-pair action too: in the query a typed `)`
-    // is text, not a step over the `)` that was there before the menu opened.
-    #[test]
-    fn auto_pairs_do_not_skip_a_closer_in_a_query_menu() {
-        let mut rl = auto_pair_engine_with_open_menu(
-            crate::InputMode::Diff,
-            &[
-                EditCommand::InsertString("()".into()),
-                EditCommand::MoveLeft { select: false },
-            ],
-        );
-
-        drive(&mut rl, &[ch(')')]);
-
-        assert_eq!(rl.editor.get_buffer(), "())");
-    }
-
-    #[test]
-    fn auto_pairs_resume_after_the_query_menu_closes() {
-        let mut rl = auto_pair_engine_with_open_menu(crate::InputMode::Diff, &[]);
-        drive(&mut rl, &[ch('(')]);
-
-        drive(&mut rl, &[key(KeyCode::Esc)]);
-        assert!(!menu_is_active(&rl), "Esc closes the menu");
-        drive(&mut rl, &[ch('(')]);
-
-        assert_eq!(rl.editor.get_buffer(), "(()");
-    }
-
     // FLIP SAFETY NET (Group C) — visual operability at the engine seam.
     // RED until the cursor-as-truth flip: `v` emits Esc which clears the
     // selection, so visual mode starts anchorless and `d` cuts nothing. The
@@ -5202,117 +5698,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "system_clipboard")]
-    #[test]
-    fn intercepted_paste_reaches_an_open_menu() {
-        // The text an interceptor returns is applied as an ordinary edit, so
-        // an open completion menu is sent `MenuEvent::Edit` for it the same
-        // way it is for a plain `PasteSystem`. The queued event is what the
-        // paint cycle reloads the values from (`update_working_details`), so
-        // that is where the difference shows: without the event the menu
-        // keeps the values it had before the paste.
-        fn apply_menu_paint_cycle(rl: &mut Reedline) {
-            let Reedline {
-                menus,
-                editor,
-                completer,
-                history,
-                painter,
-                ..
-            } = rl;
-            for menu in menus.iter_mut().filter(|menu| menu.is_active()) {
-                menu.update_working_details(editor, completer.as_mut(), history.as_ref(), painter);
-            }
-        }
-        fn active_menu_values(rl: &Reedline) -> usize {
-            rl.menus
-                .iter()
-                .find(|menu| menu.is_active())
-                .expect("menu open")
-                .get_values()
-                .len()
-        }
-
-        let interceptor = Arc::new(StubInterceptor {
-            paste_calls: std::sync::atomic::AtomicUsize::new(0),
-            action: crate::PasteAction::InsertText("r".into()),
-            expand: None,
-        });
-        let completer = Box::new(DefaultCompleter::new_with_wordlen(
-            vec![
-                String::from("carpet"),
-                String::from("cattle"),
-                String::from("dog"),
-            ],
-            1,
-        ));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        ));
-        let mut rl = Reedline::create()
-            .with_completer(completer)
-            .with_menu(completion_menu)
-            .with_paste_interceptor(interceptor);
-        let prompt = DefaultPrompt::default();
-        rl.run_edit_commands(&[EditCommand::InsertString(String::from("ca"))]);
-        rl.handle_event(
-            &prompt,
-            ReedlineEvent::Menu(String::from("completion_menu")),
-        )
-        .expect("menu opens");
-        apply_menu_paint_cycle(&mut rl);
-        assert_eq!(
-            active_menu_values(&rl),
-            2,
-            "\"ca\" matches both carpet and cattle"
-        );
-
-        rl.handle_event(&prompt, ReedlineEvent::Edit(vec![EditCommand::PasteSystem]))
-            .expect("edit ok");
-        assert_eq!(rl.editor.get_buffer(), "car");
-        apply_menu_paint_cycle(&mut rl);
-        assert_eq!(active_menu_values(&rl), 1, "narrowed to \"carpet\"");
-    }
-
-    /// Menus are found by name, so adding a second menu under a taken name
-    /// replaces the first (in its place) instead of hiding behind it.
-    #[test]
-    fn with_menu_replaces_a_menu_of_the_same_name() {
-        let menu = |name: &str, marker: &str| {
-            ReedlineMenu::EngineCompleter(Box::new(
-                ColumnarMenu::default().with_name(name).with_marker(marker),
-            ))
-        };
-        let mut rl = Reedline::create()
-            .with_completer(Box::new(DefaultCompleter::new_with_wordlen(
-                vec![String::from("carpet")],
-                1,
-            )))
-            .with_menu(menu("completion_menu", "first> "))
-            .with_menu(menu("history_menu", "history> "))
-            .with_menu(menu("completion_menu", "second> "));
-
-        let names: Vec<&str> = rl.menus.iter().map(|menu| menu.name()).collect();
-        assert_eq!(
-            names,
-            ["completion_menu", "history_menu"],
-            "the replacement keeps the original's place"
-        );
-
-        rl.run_edit_commands(&[EditCommand::InsertString(String::from("ca"))]);
-        rl.handle_event(
-            &DefaultPrompt::default(),
-            ReedlineEvent::Menu(String::from("completion_menu")),
-        )
-        .expect("menu opens");
-        let opened = rl
-            .menus
-            .iter()
-            .find(|menu| menu.is_active())
-            .expect("a menu is open");
-        assert_eq!(opened.indicator(), "second> ", "the later menu answers");
-    }
-
     #[test]
     fn paste_burst_resolve_burst_inserts_placeholder() {
         // When the hook's `resolve_burst` reference-ifies the coalesced burst
@@ -5825,30 +6210,18 @@ mod tests {
             .editor
             .edit_buffer(|buf| buf.set_insertion_point(5), UndoBehavior::MoveCursor);
 
-        reedline.last_render_snapshot = Some(RenderSnapshot {
-            screen_width: 20,
-            screen_height: 10,
-            prompt_start_row: 0,
-            prompt_height: 1,
-            large_buffer: false,
-            prompt_str_left: "".to_string(),
-            prompt_indicator: "".to_string(),
-            before_cursor: "hello".to_string(),
-            after_cursor: "".to_string(),
-            first_buffer_col: 0,
-            menu_active: false,
-            menu_start_row: None,
-            status_start_row: None,
-            large_buffer_extra_rows_after_prompt: None,
-            large_buffer_offset: None,
-            right_prompt: None,
-        });
+        reedline.painter.force_prompt_anchored_for_test(0);
+        reedline.repaint(&prompt).unwrap();
+        let (column, row) = reedline
+            .painter
+            .buffer_start_for_test()
+            .expect("painted a buffer");
 
         let result = reedline.handle_event(
             &prompt,
             ReedlineEvent::Mouse {
-                column: 0,
-                row: 0,
+                column,
+                row,
                 button: MouseButton::Left,
             },
         );
@@ -6551,7 +6924,7 @@ mod tests {
     }
 
     /// A switch while the history menu is open neither moves the cursor nor
-    /// touches the buffer the menu is querying with.
+    /// touches the line.
     #[test]
     fn switch_mode_under_an_open_history_menu_keeps_the_cursor() {
         let mut normal = crate::default_helix_normal_keybindings();
@@ -6564,15 +6937,15 @@ mod tests {
             crate::Helix::default().with_normal_keybindings(normal),
         ))
         .with_additional_edit_mode(Box::<crate::Emacs>::default())
-        .with_menu(ReedlineMenu::HistoryMenu(Box::new(
-            crate::ListMenu::default().with_name("history_menu"),
-        )));
+        .with_quick_completions(false)
+        .with_partial_completions(false)
+        .with_menu(ReedlineMenu::history("history_menu"));
         rl.history
             .save(HistoryItem::from_command_line("abcd x"))
             .expect("history ok");
         let prompt = DefaultPrompt::default();
 
-        // Caret on `c`, then open the menu over that buffer.
+        // Caret on `c`, then open the menu over that line.
         drive_until_signal(
             &mut rl,
             &[
@@ -6586,13 +6959,16 @@ mod tests {
         );
         rl.handle_event(&prompt, ReedlineEvent::Menu("history_menu".into()))
             .expect("menu opens");
-        assert!(menu_is_active(&rl), "setup: history menu is open");
+        assert!(completions_open(&rl), "setup: history menu is open");
+        assert_eq!(rl.editor.get_buffer(), "abcd", "setup: only highlighted");
+        assert_eq!(rl.completion.selected(), Some(0));
+        let cursor = rl.editor.insertion_point();
 
         drive_until_signal(&mut rl, &[alt('e')]);
         assert_eq!(rl.prompt_edit_mode(), PromptEditMode::Emacs);
         assert_eq!(rl.editor.get_buffer(), "abcd");
-        assert_eq!(rl.editor.insertion_point(), 2);
-        assert!(menu_is_active(&rl), "the menu outlives the switch");
+        assert_eq!(rl.editor.insertion_point(), cursor);
+        assert!(completions_open(&rl), "the menu outlives the switch");
     }
 
     /// No registered machine accepts the target: nothing changes, and the
@@ -6990,18 +7366,15 @@ mod tests {
     }
 
     #[test]
-    fn repaint_signal_switches_input_loop_to_polling() {
+    fn a_repaint_request_wakes_the_loop_instead_of_making_it_poll() {
         let mut reedline = Reedline::create();
+        let signal = reedline.repaint_signal();
         assert!(
             !reedline.input_needs_polling(),
-            "without external triggers the loop should block on input"
+            "a repaint handle wakes the loop, so it can still sleep on input"
         );
-
-        let _signal = reedline.repaint_signal();
-        assert!(
-            reedline.input_needs_polling(),
-            "a repaint handle must switch the loop to polling so requests are noticed"
-        );
+        signal.request_repaint();
+        assert!(reedline.wake.take_woken());
     }
 
     #[test]
@@ -7569,540 +7942,642 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_complete_line_from_history() {
-        let completer = Box::new(DefaultCompleter::new(Vec::from([String::from("67")])));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        ));
-        let mut reedline = Reedline::create()
-            .with_quick_completions(true)
-            .with_completer(completer)
-            .with_menu(completion_menu);
+    fn completions_open(reedline: &Reedline) -> bool {
+        reedline.completion.is_open()
+    }
 
-        // Save "6" to the history and scroll back to it
-        let history = HistoryItem::from_command_line("6");
-        reedline.history.save(history).unwrap();
+    /// An engine over the words "test", "this" and "that", answering at once,
+    /// with a menu named "completion_menu" and Tab bound to open it, or to
+    /// step through what it shows.
+    fn engine_over_words(words: &[&str]) -> Reedline {
+        let tab = ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".into()),
+            ReedlineEvent::MenuNext,
+        ]);
+        let words = words.iter().map(|word| (*word).to_owned()).collect();
+        seam_engine(emacs_with(KeyModifiers::NONE, KeyCode::Tab, tab))
+            .with_completer(Box::new(DefaultCompleter::new_with_wordlen(words, 1)))
+            .with_menu(ReedlineMenu::new("completion_menu"))
+    }
+
+    fn engine_over_th_words() -> Reedline {
+        engine_over_words(&["test", "this", "that"])
+    }
+
+    /// Types `text` as one edit, the way a paste would arrive.
+    fn type_text(reedline: &mut Reedline, text: &str) {
+        send_edit(reedline, EditCommand::InsertString(text.into()));
+    }
+
+    /// The value of the highlighted suggestion.
+    fn highlighted(reedline: &Reedline) -> Option<&str> {
+        let shown = reedline.completion.shown()?;
+        let item = shown.items.get(reedline.completion.selected()?)?;
+        Some(item.value.as_str())
+    }
+
+    /// An engine with "th" typed and its menu opened: "that" and "this" are
+    /// shown and the first is highlighted, the line left as typed.
+    fn engine_with_selection() -> Reedline {
+        let mut reedline = engine_over_th_words();
+        type_text(&mut reedline, "th");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        assert_eq!(reedline.current_buffer_contents(), "th", "setup");
+        assert_eq!(highlighted(&reedline), Some("that"), "setup");
+        reedline
+    }
+
+    /// A completer that keeps each reply and the line it was asked about, to
+    /// answer later, as one working on another thread would.
+    #[derive(Clone, Default)]
+    struct Parked(Arc<Mutex<Vec<Parcel>>>);
+
+    /// A request a [`Parked`] completer holds: the line, and the reply to it.
+    type Parcel = (String, Reply<Completions>);
+
+    impl Parked {
+        /// The oldest request not answered yet, with the line it was about.
+        fn next(&self) -> (String, Reply<Completions>) {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+
+    impl Completer for Parked {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((request.line.to_owned(), reply));
+        }
+    }
+
+    /// One suggestion replacing the first `typed` bytes of the line.
+    fn reply_with(reply: Reply<Completions>, value: &str, typed: usize) {
+        reply.send(
+            vec![Suggestion {
+                value: value.into(),
+                span: Span::new(0, typed),
+                ..Suggestion::default()
+            }]
+            .into(),
+        );
+    }
+
+    #[test]
+    fn a_menu_named_in_a_binding_opens_and_selects() {
+        let mut reedline = engine_over_th_words();
+        type_text(&mut reedline, "th");
+
+        let unknown = send(&mut reedline, ReedlineEvent::Menu("nope".into()));
+        assert!(matches!(unknown, EventStatus::Inapplicable));
+        assert_eq!(reedline.current_buffer_contents(), "th");
+
+        let opened = send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        assert!(matches!(opened, EventStatus::Handled));
+        assert!(completions_open(&reedline));
+        assert_eq!(reedline.current_buffer_contents(), "th");
+        assert_eq!(highlighted(&reedline), Some("that"));
+    }
+
+    /// Menus are found by name, so adding a second menu under a taken name
+    /// replaces the first (in its place) instead of hiding behind it.
+    #[test]
+    fn with_menu_replaces_a_menu_of_the_same_name() {
+        let reedline = Reedline::create()
+            .with_menu(ReedlineMenu::new("completion_menu").with_marker("first> "))
+            .with_menu(ReedlineMenu::history("history_menu"))
+            .with_menu(ReedlineMenu::new("completion_menu").with_marker("second> "));
+
+        let names: Vec<&str> = reedline.menus.iter().map(ReedlineMenu::name).collect();
+        assert_eq!(
+            names,
+            ["completion_menu", "history_menu"],
+            "the replacement keeps the original's place"
+        );
+        assert_eq!(reedline.menus[0].marker(), "second> ");
+    }
+
+    #[test]
+    fn tab_with_one_suggestion_accepts_it() {
+        let mut reedline = engine_over_words(&["67"]);
+        reedline
+            .history
+            .save(HistoryItem::from_command_line("6"))
+            .unwrap();
         reedline.previous_history().expect("history ok");
         assert_eq!(reedline.current_buffer_contents(), "6");
 
-        // Perform quick completion
-        let prompt = DefaultPrompt::default();
-        let completion = ReedlineEvent::Menu(String::from("completion_menu"));
-        reedline.handle_event(&prompt, completion).unwrap();
+        drive(&mut reedline, &[key(KeyCode::Tab)]);
+
         assert_eq!(reedline.current_buffer_contents(), "67");
-
-        // Insert the "x" to the prompt
-        let insertion = EditCommand::InsertString(String::from("x"));
-        reedline.run_edit_commands(&[insertion]);
-        assert_eq!(reedline.current_buffer_contents(), "67x");
+        assert!(!completions_open(&reedline), "taking it closes the menu");
+        assert_eq!(reedline.current_insertion_point(), 2);
     }
 
-    /// A completer that computes in the background: the first request cannot be answered
-    /// for the line on screen, and only later ones carry its values. This is what a cold
-    /// cache looks like from the engine's side (nushell/reedline#1142).
-    struct DeferredCompleter {
-        first_answer: CompletionResult,
-        values: Vec<String>,
-        dispatched: bool,
-    }
-
-    impl DeferredCompleter {
-        /// A cold cache: nothing to show at all until the background work lands.
-        fn pending(values: &[&str]) -> Self {
-            Self::new(CompletionResult::Pending, values)
-        }
-
-        /// A warm-but-wrong cache: `stale` is answered from a neighbouring entry, so the
-        /// value is real but its span belongs to `origin_buffer` rather than the line.
-        fn stale(stale: &str, origin_buffer: &str, values: &[&str]) -> Self {
-            let first_answer = CompletionResult::Stale {
-                suggestions: vec![Suggestion {
-                    value: stale.to_string(),
-                    span: Span {
-                        start: 0,
-                        end: origin_buffer.len(),
-                    },
-                    ..Default::default()
-                }]
-                .into(),
-                origin: CompletionOrigin::new(origin_buffer, origin_buffer.len()),
-                partial: None,
-            };
-            Self::new(first_answer, values)
-        }
-
-        fn new(first_answer: CompletionResult, values: &[&str]) -> Self {
-            Self {
-                first_answer,
-                values: values.iter().map(|value| value.to_string()).collect(),
-                dispatched: false,
-            }
-        }
-    }
-
-    impl Completer for DeferredCompleter {
-        fn complete(&mut self, _line: &str, pos: usize) -> CompletionResult {
-            if !self.dispatched {
-                self.dispatched = true;
-                return self.first_answer.clone();
-            }
-            CompletionResult::fresh(
-                self.values
-                    .iter()
-                    .map(|value| Suggestion {
-                        value: value.clone(),
-                        span: Span { start: 0, end: pos },
-                        ..Default::default()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        }
-
-        fn poll_completion(&mut self) -> CompletionStatus {
-            if self.dispatched {
-                CompletionStatus::Ready
-            } else {
-                CompletionStatus::Idle
-            }
-        }
-    }
-
-    /// [`engine_awaiting`] with partial completions off.
-    fn engine_awaiting_completions(values: &[&str], buffer: &str, quick: bool) -> Reedline {
-        engine_awaiting(values, buffer, quick, false)
-    }
-
-    /// Engine with `quick` and `partial` completions and a background completer over
-    /// `values`, with `buffer` typed and the completion menu activated — the state right
-    /// after Tab, while the completer is still working.
-    fn engine_awaiting(values: &[&str], buffer: &str, quick: bool, partial: bool) -> Reedline {
-        let (reedline, _) = activate_menu_over(
-            Box::new(DeferredCompleter::pending(values)),
-            buffer,
-            quick,
-            partial,
-        );
-
-        // Nothing could be decided yet, the premise of every test below.
-        assert_eq!(reedline.current_buffer_contents(), buffer);
-        reedline
-    }
-
-    /// Type `buffer` and press Tab, against a completer that answers however the test
-    /// needs it to. Returns the engine and how the menu activation was handled.
-    fn activate_menu_over(
-        completer: Box<dyn Completer + Send>,
-        buffer: &str,
-        quick: bool,
-        partial: bool,
-    ) -> (Reedline, EventStatus) {
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        ));
-        let mut reedline = Reedline::create()
-            .with_completer(completer)
-            .with_menu(completion_menu)
-            .with_quick_completions(quick)
-            .with_partial_completions(partial);
-
-        // Settling repaints, which needs a painter that believes it is on a terminal.
-        // Size first: `handle_resize` invalidates the anchor the next line pins.
-        reedline.painter.handle_resize(80, 24);
-        reedline.painter.force_prompt_anchored_for_test(0);
-
-        reedline.run_edit_commands(&[EditCommand::InsertString(buffer.to_string())]);
-        let status = reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Menu(String::from("completion_menu")),
-            )
-            .unwrap();
-
-        (reedline, status)
-    }
-
-    fn settle(reedline: &mut Reedline) {
-        reedline
-            .settle_completions(&DefaultPrompt::default())
-            .unwrap();
-    }
-
-    /// The regression: a lone suggestion that arrives after the menu opened must still be
-    /// accepted, exactly as a synchronous completer's would have been.
     #[test]
-    fn quick_completion_accepts_a_lone_suggestion_that_arrives_late() {
-        let mut reedline = engine_awaiting_completions(&["crates"], "cr", true);
+    fn tab_types_the_shared_start_then_steps_through_the_suggestions() {
+        let mut reedline = engine_over_words(&["thing", "think"]);
+        type_text(&mut reedline, "t");
+        let tab = key(KeyCode::Tab);
 
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "crates");
-        assert!(!menu_is_active(&reedline), "accepting closes the menu");
-    }
-
-    /// The decision belongs to the keystroke that asked for it. Once the user has typed
-    /// on, a late result must not rewrite the line underneath them.
-    #[test]
-    fn a_late_lone_suggestion_is_dropped_once_the_line_moved_on() {
-        let mut reedline = engine_awaiting_completions(&["crates"], "cr", true);
-
-        send_edit(&mut reedline, EditCommand::InsertChar('a'));
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "cra");
-    }
-
-    /// Arming happens before the count is final, so settling has to re-check it: several
-    /// suggestions mean a menu, not an acceptance.
-    #[test]
-    fn late_results_with_several_suggestions_only_populate_the_menu() {
-        let mut reedline = engine_awaiting_completions(&["test", "this", "that"], "t", true);
-
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "t");
-        assert!(menu_is_active(&reedline));
-    }
-
-    /// An arm is spent by the result that settles it, so a later request cannot inherit it.
-    #[test]
-    fn an_unsatisfied_arm_does_not_fire_on_a_later_result() {
-        let mut reedline = engine_awaiting_completions(&["test", "this", "that"], "t", true);
-
-        settle(&mut reedline);
-        assert!(reedline.deferred_menu_completion.is_none(), "arm is spent");
-
-        // A second round of results, now down to one value, with no Tab in between.
-        reedline.completer = Box::new(DeferredCompleter::pending(&["test"]));
-        reedline.completer.complete("t", 1);
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "t");
-    }
-
-    /// The other half of the same Tab: partial completions read the same empty menu the
-    /// quick check did, so a shared prefix must be spliced in when the values land.
-    #[test]
-    fn late_results_splice_the_shared_prefix() {
-        let mut reedline = engine_awaiting(&["nu-cmd-base", "nu-cmd-lang"], "nu-cm", true, true);
-
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "nu-cmd-");
-    }
-
-    /// A shared prefix is spliced under `partial` alone, with no quick completions.
-    #[test]
-    fn late_results_splice_the_shared_prefix_without_quick_completions() {
-        let mut reedline = engine_awaiting(&["nu-cmd-base", "nu-cmd-lang"], "nu-cm", false, true);
-
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "nu-cmd-");
-    }
-
-    /// Accepting a lone value wins over splicing, as it does on activation.
-    #[test]
-    fn a_lone_late_suggestion_is_accepted_rather_than_spliced() {
-        let mut reedline = engine_awaiting(&["crates"], "cr", true, true);
-
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "crates");
-        assert!(!menu_is_active(&reedline));
-    }
-
-    /// Splicing is owed to a keystroke too, and is void once the line moved on.
-    #[test]
-    fn a_late_shared_prefix_is_dropped_once_the_line_moved_on() {
-        let mut reedline = engine_awaiting(&["nu-cmd-base", "nu-cmd-lang"], "nu-cm", true, true);
-
-        send_edit(&mut reedline, EditCommand::InsertChar('d'));
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "nu-cmd");
-    }
-
-    /// With quick completions off, late results populate the menu and nothing else.
-    #[test]
-    fn late_results_never_auto_accept_without_quick_completions() {
-        let mut reedline = engine_awaiting_completions(&["crates"], "cr", false);
-
-        settle(&mut reedline);
-
-        assert_eq!(reedline.current_buffer_contents(), "cr");
-        assert!(menu_is_active(&reedline));
-    }
-
-    /// A lone *stale* suggestion looks like a lone fresh one to the quick completion
-    /// check, but accepting it is a no-op. The Tab must still be honoured once the real
-    /// answer lands.
-    #[test]
-    fn a_lone_stale_suggestion_does_not_swallow_the_completion() {
-        let (mut reedline, _) = activate_menu_over(
-            Box::new(DeferredCompleter::stale("console", "co", &["crates"])),
-            "cr",
-            true,
-            false,
-        );
-
-        // The stale span is refused, so the buffer is untouched.
-        assert_eq!(reedline.current_buffer_contents(), "cr");
-
-        settle(&mut reedline);
-
+        drive(&mut reedline, &[tab]);
         assert_eq!(
             reedline.current_buffer_contents(),
-            "crates",
-            "the fresh result was dropped because the stale one closed the menu first"
+            "thin",
+            "the shared start"
         );
+
+        assert_eq!(highlighted(&reedline), None, "nothing is highlighted yet");
+
+        // Nothing more is shared: the highlight lands on the first row and
+        // the line stays as it is.
+        drive(&mut reedline, &[tab]);
+        assert_eq!(highlighted(&reedline), Some("thing"));
+        assert_eq!(reedline.current_buffer_contents(), "thin");
+        drive(&mut reedline, &[tab]);
+        assert_eq!(highlighted(&reedline), Some("think"));
+        drive(&mut reedline, &[tab]);
+        assert_eq!(highlighted(&reedline), Some("thing"), "it wraps");
+        assert_eq!(reedline.current_buffer_contents(), "thin");
+
+        // Enter takes the highlighted item.
+        send(&mut reedline, ReedlineEvent::Enter);
+        assert_eq!(reedline.current_buffer_contents(), "thing");
+        assert!(!completions_open(&reedline));
     }
 
-    /// The same lone stale value through the second route: `MenuNext` with the menu
-    /// already open. The accept is refused downstream either way, but the `Enter` it
-    /// rode on would still deactivate the menu, so the pending completion had nothing
-    /// left to land in.
     #[test]
-    fn menu_next_does_not_close_the_menu_over_a_lone_stale_value() {
-        let (mut reedline, _) = activate_menu_over(
-            Box::new(DeferredCompleter::stale("console", "co", &["crates"])),
-            "cr",
-            true,
-            false,
-        );
-        assert!(menu_is_active(&reedline), "setup");
+    fn esc_drops_the_highlight_then_closes_the_menu() {
+        let mut reedline = engine_with_selection();
 
-        reedline
-            .handle_event(&DefaultPrompt::default(), ReedlineEvent::MenuNext)
-            .unwrap();
+        let first = send(&mut reedline, ReedlineEvent::Esc);
+        assert!(matches!(first, EventStatus::Handled));
+        assert_eq!(highlighted(&reedline), None);
+        assert_eq!(reedline.current_buffer_contents(), "th");
+        assert!(
+            completions_open(&reedline),
+            "the first Esc only unhighlights"
+        );
+
+        let second = send(&mut reedline, ReedlineEvent::Esc);
+        assert!(matches!(second, EventStatus::Handled));
+        assert!(!completions_open(&reedline));
+        assert_eq!(reedline.current_buffer_contents(), "th");
+    }
+
+    /// Esc can fall back to a custom action: it drops a highlight and hides
+    /// the menu, and only with nothing to cancel does the chain move on.
+    #[test]
+    fn esc_under_until_found_yields_to_the_next_event_only_when_inapplicable() {
+        let esc_binding = || {
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::Esc,
+                ReedlineEvent::Edit(vec![EditCommand::Clear]),
+            ])
+        };
+        let mut reedline = engine_with_selection();
+
+        send(&mut reedline, esc_binding());
+        send(&mut reedline, esc_binding());
+        assert!(!completions_open(&reedline));
+        assert_eq!(reedline.current_buffer_contents(), "th");
+
+        send(&mut reedline, esc_binding());
+        assert_eq!(reedline.current_buffer_contents(), "");
+    }
+
+    /// `Enter`, `Submit` and `SubmitOrNewline` all offer the key to
+    /// `MenuAccept` first, so a selection takes all three the same way.
+    #[rstest]
+    #[case::enter(ReedlineEvent::Enter)]
+    #[case::submit(ReedlineEvent::Submit)]
+    #[case::submit_or_newline(ReedlineEvent::SubmitOrNewline)]
+    fn every_submit_event_accepts_a_selection(#[case] event: ReedlineEvent) {
+        let mut reedline = engine_with_selection();
+
+        let status = send(&mut reedline, event);
+
+        assert!(matches!(status, EventStatus::Handled), "the menu takes it");
+        assert_eq!(reedline.current_buffer_contents(), "that");
+        assert!(!completions_open(&reedline), "and closes behind it");
+    }
+
+    /// With suggestions shown but none selected, the keys mean what they
+    /// always meant.
+    #[rstest]
+    #[case::enter(ReedlineEvent::Enter)]
+    #[case::submit(ReedlineEvent::Submit)]
+    #[case::submit_or_newline(ReedlineEvent::SubmitOrNewline)]
+    fn every_submit_event_runs_the_line_without_a_selection(#[case] event: ReedlineEvent) {
+        let mut reedline = engine_over_th_words().with_passive_completions(true);
+        type_text(&mut reedline, "th");
+        assert!(completions_open(&reedline), "setup: shown while typing");
+
+        let status = send(&mut reedline, event);
 
         assert!(
-            menu_is_active(&reedline),
-            "MenuNext accepted a provisional lone value and closed the menu"
+            matches!(status, EventStatus::Exits(Signal::Success(ref line)) if line == "th"),
+            "the line ran as typed"
         );
-        assert_eq!(reedline.current_buffer_contents(), "cr");
-
-        // With the menu still open, the arm from the activation is still owed.
-        settle(&mut reedline);
-        assert_eq!(reedline.current_buffer_contents(), "crates");
     }
 
-    /// The flicker: a menu opened over an answer that is not about this line stays off
-    /// screen, so a Tab that resolves to one suggestion never draws a menu at all.
     #[test]
-    fn an_opening_menu_is_not_visible_until_answered() {
-        let (reedline, _) = activate_menu_over(
-            Box::new(DeferredCompleter::stale("console", "co", &["crates"])),
-            "cr",
-            true,
-            false,
-        );
-
-        let menu = reedline
-            .menus
-            .iter()
-            .find(|menu| menu.is_active())
-            .expect("the menu is open");
-        assert!(
-            menu.is_awaiting_first_answer(),
-            "it would only be taken away again once the real answer lands"
-        );
-    }
-
-    fn menu_is_active(reedline: &Reedline) -> bool {
-        reedline.menus.iter().any(|menu| menu.is_active())
-    }
-
-    /// Engine with a completion menu activated on a "th" buffer. "th" matches
-    /// two words, so quick completions don't auto-select on activation.
-    fn engine_with_active_menu(quick: bool, persistent: bool) -> Reedline {
-        let completer = Box::new(DefaultCompleter::new_with_wordlen(
-            vec![
-                String::from("test"),
-                String::from("this"),
-                String::from("that"),
-            ],
-            1,
-        ));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        ));
-        let mut reedline = Reedline::create()
-            .with_completer(completer)
-            .with_menu(completion_menu)
-            .with_quick_completions(quick)
-            .with_persistent_menus(persistent);
-
+    fn menu_accept_without_a_selection_is_inapplicable() {
+        let mut reedline = Reedline::create();
         reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Menu(String::from("completion_menu")),
-            )
-            .unwrap();
-        assert!(menu_is_active(&reedline));
-        reedline
+
+        let status = send(&mut reedline, ReedlineEvent::MenuAccept);
+
+        assert!(matches!(status, EventStatus::Inapplicable));
+        assert_eq!(reedline.current_buffer_contents(), "th");
     }
 
-    /// The menu maintenance the paint cycle runs between keystrokes — value
-    /// refresh only, no layout (the headless test painter has no width) — so
-    /// an assertion after a typed character sees what a user would on screen.
-    fn apply_menu_maintenance(reedline: &mut Reedline) {
-        for menu in reedline.menus.iter_mut() {
-            if menu.is_active() {
-                menu.update_values(
-                    &mut reedline.editor,
-                    reedline.completer.as_mut(),
-                    reedline.history.as_ref(),
-                );
-            }
-        }
-    }
-
-    // --- a stale menu must not intercept Enter ---
-    //
-    // The completion menu stays active while the user types past it, and any
-    // Enter while a menu is active is routed to the menu. Left unguarded that
-    // turns Enter into a dead key (empty menu) or an insertion of whatever the
-    // menu last highlighted (non-empty menu) at the end of a finished line.
-
-    /// `Enter`, `Submit` and `SubmitOrNewline` all reach the line through
-    /// `MenuAccept`, so an open menu takes all three the same way.
-    #[rstest]
-    #[case::enter(ReedlineEvent::Enter)]
-    #[case::submit(ReedlineEvent::Submit)]
-    #[case::submit_or_newline(ReedlineEvent::SubmitOrNewline)]
-    fn every_submit_event_accepts_an_open_menu(#[case] event: ReedlineEvent) {
-        let mut reedline = engine_with_active_menu(false, false);
-        reedline.painter.force_prompt_anchored_for_test(0);
-        apply_menu_maintenance(&mut reedline);
-        let prompt = DefaultPrompt::default();
-
-        let status = reedline.handle_event(&prompt, event).unwrap();
-
-        assert!(
-            matches!(status, EventStatus::Handled),
-            "the menu takes the keypress"
-        );
-        assert!(!menu_is_active(&reedline), "and closes behind the accept");
-        assert_ne!(
-            reedline.editor.get_buffer(),
-            "th",
-            "the selection reached the buffer"
-        );
-    }
-
-    /// And once the menu declines, all three mean what they always meant.
-    #[rstest]
-    #[case::enter(ReedlineEvent::Enter)]
-    #[case::submit(ReedlineEvent::Submit)]
-    #[case::submit_or_newline(ReedlineEvent::SubmitOrNewline)]
-    fn every_submit_event_passes_an_empty_menu(#[case] event: ReedlineEvent) {
-        let mut reedline = engine_with_active_menu(false, false);
-        reedline.painter.force_prompt_anchored_for_test(0);
-        let prompt = DefaultPrompt::default();
-        // "thz" matches nothing; the menu refilters to empty but stays active.
-        reedline
-            .handle_event(
-                &prompt,
-                ReedlineEvent::Edit(vec![EditCommand::InsertChar('z')]),
-            )
-            .unwrap();
-        apply_menu_maintenance(&mut reedline);
-        assert!(menu_is_active(&reedline));
-
-        let status = reedline.handle_event(&prompt, event).unwrap();
-
-        assert!(
-            matches!(status, EventStatus::Exits(Signal::Success(ref s)) if s == "thz"),
-            "the line ran"
-        );
-    }
-
-    /// A menu whose filtered suggestions are empty has nothing to accept:
-    /// Enter must close it and submit the line, not be swallowed.
+    /// The binding this exists for: space accepts the selection and then
+    /// types itself, and stays a plain space when nothing is selected.
     #[test]
-    fn enter_with_an_empty_menu_submits_the_line() {
-        let mut reedline = engine_with_active_menu(false, false);
-        reedline.painter.force_prompt_anchored_for_test(0);
-        let prompt = DefaultPrompt::default();
-        // "thz" matches nothing; the menu refilters to empty but stays active.
-        reedline
-            .handle_event(
-                &prompt,
-                ReedlineEvent::Edit(vec![EditCommand::InsertChar('z')]),
-            )
-            .unwrap();
-        apply_menu_maintenance(&mut reedline);
-        assert!(menu_is_active(&reedline));
+    fn menu_accept_chains_with_an_edit_as_a_space_binding() {
+        let space_binding = || {
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::MenuAccept,
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
+            ])
+        };
 
-        let status = reedline
-            .handle_event(&prompt, ReedlineEvent::Enter)
-            .unwrap();
-        assert!(
-            matches!(status, EventStatus::Exits(Signal::Success(ref s)) if s == "thz"),
-            "Enter was swallowed by an empty menu"
-        );
-        assert!(!menu_is_active(&reedline));
+        let mut reedline = engine_with_selection();
+        send(&mut reedline, space_binding());
+        assert_eq!(reedline.current_buffer_contents(), "that ");
+        assert!(!completions_open(&reedline));
+
+        let mut reedline = Reedline::create();
+        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
+        send(&mut reedline, space_binding());
+        assert_eq!(reedline.current_buffer_contents(), "th ");
     }
 
-    /// The full shape of the report this fixes: Tab opens the menu mid-line,
-    /// the user types the rest of the statement and hits Enter. Before the
-    /// fix the Enter was consumed by the stale menu instead of submitting.
+    /// The same pair under `UntilFound` is "accept, or else type a space": an
+    /// accepted selection is not followed by the space.
     #[test]
-    fn typing_past_a_completion_then_enter_runs_the_line() {
-        let mut reedline = engine_with_active_menu(false, false);
-        reedline.painter.force_prompt_anchored_for_test(0);
-        let prompt = DefaultPrompt::default();
-        for c in " more words".chars() {
+    fn menu_accept_under_until_found_yields_to_the_next_event_only_when_inapplicable() {
+        let space_binding = || {
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::MenuAccept,
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
+            ])
+        };
+
+        let mut reedline = engine_with_selection();
+        send(&mut reedline, space_binding());
+        assert_eq!(reedline.current_buffer_contents(), "that");
+
+        let mut reedline = Reedline::create();
+        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
+        send(&mut reedline, space_binding());
+        assert_eq!(reedline.current_buffer_contents(), "th ");
+    }
+
+    /// Typing on lets go of the highlight and edits the line as typed.
+    #[test]
+    fn typing_on_a_highlight_lets_go_of_it() {
+        let mut reedline = engine_with_selection();
+
+        insert(&mut reedline, 'a');
+
+        assert_eq!(reedline.current_buffer_contents(), "tha");
+        assert_eq!(highlighted(&reedline), None);
+        assert_eq!(
+            reedline.completion.shown().map(|c| c.items.len()),
+            Some(1),
+            "asked again for the new word"
+        );
+    }
+
+    #[test]
+    fn passive_completions_follow_typing_until_esc() {
+        let mut reedline = engine_over_th_words().with_passive_completions(true);
+
+        type_text(&mut reedline, "th");
+        assert!(completions_open(&reedline));
+        insert(&mut reedline, 'z');
+        assert!(!completions_open(&reedline), "nothing matches \"thz\"");
+
+        send_edit(&mut reedline, EditCommand::Backspace);
+        assert!(completions_open(&reedline));
+        send(&mut reedline, ReedlineEvent::Esc);
+        assert!(!completions_open(&reedline));
+        insert(&mut reedline, 'i');
+        assert!(
+            !completions_open(&reedline),
+            "hidden until the word is left"
+        );
+
+        insert(&mut reedline, ' ');
+        insert(&mut reedline, 't');
+        assert!(completions_open(&reedline), "a new word shows them again");
+    }
+
+    #[test]
+    fn completions_stay_hidden_without_passive_completions() {
+        let mut reedline = engine_over_th_words();
+
+        type_text(&mut reedline, "th");
+
+        assert!(!completions_open(&reedline));
+    }
+
+    /// An edit that is not completion's own asks again, so the suggestions
+    /// follow a paste or a macro the same way they follow typing.
+    #[test]
+    fn an_edit_that_is_not_typing_asks_the_completions_again() {
+        let mut reedline =
+            engine_over_words(&["carpet", "cattle", "dog"]).with_passive_completions(true);
+        type_text(&mut reedline, "ca");
+        let shown = |reedline: &Reedline| reedline.completion.shown().map(|c| c.items.len());
+        assert_eq!(shown(&reedline), Some(2));
+
+        type_text(&mut reedline, "r");
+
+        assert_eq!(shown(&reedline), Some(1), "narrowed to \"carpet\"");
+    }
+
+    #[cfg(feature = "system_clipboard")]
+    #[test]
+    fn intercepted_paste_reaches_open_completions() {
+        let interceptor = Arc::new(StubInterceptor {
+            paste_calls: std::sync::atomic::AtomicUsize::new(0),
+            action: crate::PasteAction::InsertText("r".into()),
+            expand: None,
+        });
+        let mut reedline = engine_over_words(&["carpet", "cattle", "dog"])
+            .with_passive_completions(true)
+            .with_paste_interceptor(interceptor);
+        type_text(&mut reedline, "ca");
+        assert_eq!(reedline.completion.shown().map(|c| c.items.len()), Some(2));
+
+        send_edit(&mut reedline, EditCommand::PasteSystem);
+
+        assert_eq!(reedline.current_buffer_contents(), "car");
+        assert_eq!(reedline.completion.shown().map(|c| c.items.len()), Some(1));
+    }
+
+    #[test]
+    fn the_history_menu_lists_matching_lines_newest_first() {
+        let mut reedline = Reedline::create()
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::history("history_menu"));
+        for line in ["git status", "ls", "git stash"] {
             reedline
-                .handle_event(
-                    &prompt,
-                    ReedlineEvent::Edit(vec![EditCommand::InsertChar(c)]),
-                )
+                .history
+                .save(HistoryItem::from_command_line(line))
                 .unwrap();
         }
-        apply_menu_maintenance(&mut reedline);
+        type_text(&mut reedline, "sta");
 
-        let status = reedline
-            .handle_event(&prompt, ReedlineEvent::Enter)
-            .unwrap();
+        send(&mut reedline, ReedlineEvent::Menu("history_menu".into()));
+
+        let shown: Vec<&str> = reedline
+            .completion
+            .shown()
+            .expect("history is listed")
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect();
+        assert_eq!(shown, ["git stash", "git status"]);
+        assert_eq!(highlighted(&reedline), Some("git stash"));
+
+        send(&mut reedline, ReedlineEvent::MenuNext);
+        assert_eq!(highlighted(&reedline), Some("git status"));
+        assert_eq!(reedline.current_buffer_contents(), "sta");
+        send(&mut reedline, ReedlineEvent::Enter);
+        assert_eq!(reedline.current_buffer_contents(), "git status");
+    }
+
+    #[test]
+    fn menu_events_are_inapplicable_with_nothing_to_move_through() {
+        let mut reedline = Reedline::create();
+        type_text(&mut reedline, "th");
+
+        for event in [
+            ReedlineEvent::MenuNext,
+            ReedlineEvent::MenuUp,
+            ReedlineEvent::MenuPageNext,
+            ReedlineEvent::MenuPreview,
+        ] {
+            let status = send(&mut reedline, event);
+            assert!(matches!(status, EventStatus::Inapplicable));
+        }
+        assert_eq!(reedline.current_buffer_contents(), "th");
+    }
+
+    /// A Tab asked before its answer arrives is done when the answer lands,
+    /// as a synchronous completer's would have been.
+    #[test]
+    fn a_tab_asked_before_its_answer_is_done_when_it_lands() {
+        let parked = Parked::default();
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(parked.clone()))
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        type_text(&mut reedline, "cr");
+
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        assert_eq!(reedline.current_buffer_contents(), "cr", "nothing yet");
+        assert!(!reedline.land_completions(), "nothing arrived");
+
+        let (line, reply) = parked.next();
+        assert_eq!(line, "cr");
+        reply_with(reply, "crates", 2);
+        assert!(reedline.land_completions());
+
+        assert_eq!(reedline.current_buffer_contents(), "crates");
         assert!(
-            matches!(status, EventStatus::Exits(Signal::Success(ref s)) if s == "th more words"),
-            "the line was not submitted intact"
+            !completions_open(&reedline),
+            "the lone suggestion was taken"
         );
     }
 
-    /// A completion menu open over "th", closing at the end of the word for
-    /// the given word characters.
-    fn engine_with_word_bounded_menu(word_chars: &str, persistent: bool) -> Reedline {
-        let completer = Box::new(DefaultCompleter::new_with_wordlen(
-            vec![
-                String::from("test"),
-                String::from("this"),
-                String::from("that"),
-            ],
-            1,
-        ));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default()
-                .with_name("completion_menu")
-                .with_word_chars(word_chars),
-        ));
+    /// A reply for an older line is never shown: the answer to what was typed
+    /// last is the only one kept.
+    #[test]
+    fn a_reply_for_an_older_line_is_never_shown() {
+        let parked = Parked::default();
         let mut reedline = Reedline::create()
-            .with_completer(completer)
-            .with_menu(completion_menu)
-            .with_persistent_menus(persistent);
+            .with_completer(Box::new(parked.clone()))
+            .with_passive_completions(true);
+        insert(&mut reedline, 'c');
+        insert(&mut reedline, 'r');
+        let (older, stale) = parked.next();
+        let (newer, current) = parked.next();
+        assert_eq!((older.as_str(), newer.as_str()), ("c", "cr"));
+        assert!(!stale.is_current() && current.is_current());
 
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Menu(String::from("completion_menu")),
-            )
-            .unwrap();
-        assert!(menu_is_active(&reedline));
-        reedline
+        reply_with(stale, "console", 1);
+        assert!(!reedline.land_completions());
+        assert!(!completions_open(&reedline));
+
+        reply_with(current, "crates", 2);
+        assert!(reedline.land_completions());
+        assert!(completions_open(&reedline));
+        let items = &reedline.completion.shown().expect("shown").items;
+        assert_eq!(items[0].value, "crates");
+    }
+
+    /// A completer that offers two suggestions and previews the one it is
+    /// asked about.
+    struct Previewing;
+
+    impl Completer for Previewing {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            let item = |mark: &str| Suggestion {
+                value: format!("{}{mark}", request.line),
+                span: Span::new(0, request.line.len()),
+                ..Suggestion::default()
+            };
+            reply.send(vec![item("!"), item("?")].into());
+        }
+
+        fn preview(
+            &mut self,
+            completions: &Completions,
+            index: usize,
+            _width: u16,
+            reply: Reply<Preview>,
+        ) {
+            reply.send(vec![format!("about {}", completions.items[index].value)].into());
+        }
+    }
+
+    fn about(text: &str) -> Option<Vec<String>> {
+        Some(vec![format!("about {text}")])
+    }
+
+    #[test]
+    fn moving_through_suggestions_previews_them_until_the_selection_is_released() {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(Previewing))
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        type_text(&mut reedline, "ab");
+        assert!(reedline.completion.preview().is_none(), "nothing selected");
+
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        assert_eq!(
+            reedline
+                .completion
+                .preview()
+                .map(|preview| preview.rows.clone()),
+            about("ab!")
+        );
+        send(&mut reedline, ReedlineEvent::MenuDown);
+        assert_eq!(
+            reedline
+                .completion
+                .preview()
+                .map(|preview| preview.rows.clone()),
+            about("ab?")
+        );
+
+        // Typing on lets go of the highlight, and the preview with it.
+        insert(&mut reedline, 'c');
+        assert!(reedline.completion.preview().is_none());
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        assert_eq!(
+            reedline
+                .completion
+                .preview()
+                .map(|preview| preview.rows.clone()),
+            about("abc!")
+        );
+    }
+
+    #[test]
+    fn menu_preview_turns_previews_off_and_on_for_the_session() {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(Previewing))
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        type_text(&mut reedline, "ab");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        assert!(reedline.completion.preview().is_some());
+
+        let toggled = send(&mut reedline, ReedlineEvent::MenuPreview);
+        assert!(matches!(toggled, EventStatus::Handled));
+        assert!(reedline.completion.preview().is_none(), "off");
+        send(&mut reedline, ReedlineEvent::MenuDown);
+        assert!(
+            reedline.completion.preview().is_none(),
+            "stays off while moving"
+        );
+
+        send(&mut reedline, ReedlineEvent::MenuPreview);
+        assert_eq!(
+            reedline
+                .completion
+                .preview()
+                .map(|preview| preview.rows.clone()),
+            about("ab?")
+        );
+    }
+
+    /// A completer whose first suggestion has a folded part to its preview
+    /// and whose second has none.
+    struct Folding;
+
+    impl Completer for Folding {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            Previewing.complete(request, reply);
+        }
+
+        fn preview(
+            &mut self,
+            _completions: &Completions,
+            index: usize,
+            _width: u16,
+            reply: Reply<Preview>,
+        ) {
+            reply.send(Preview {
+                rows: vec!["shown".into()],
+                more: if index == 0 {
+                    vec!["folded".into()]
+                } else {
+                    vec![]
+                },
+                summary: "1 more".into(),
+                ..Preview::default()
+            });
+        }
+    }
+
+    #[test]
+    fn menu_preview_cycles_folded_unfolded_hidden_and_skips_unfolded_without_a_fold() {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(Folding))
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        type_text(&mut reedline, "ab");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        let state = |reedline: &Reedline| {
+            let preview = reedline.completion.preview()?;
+            Some(preview.shown(reedline.completion.unfolded()).to_vec())
+        };
+        let rows = |texts: &[&str]| Some(texts.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(state(&reedline), rows(&["shown"]), "folded");
+        send(&mut reedline, ReedlineEvent::MenuPreview);
+        assert_eq!(state(&reedline), rows(&["shown", "folded"]), "unfolded");
+        send(&mut reedline, ReedlineEvent::MenuPreview);
+        assert_eq!(state(&reedline), None, "hidden");
+        send(&mut reedline, ReedlineEvent::MenuPreview);
+        assert_eq!(state(&reedline), rows(&["shown"]), "folded again");
+
+        // Nothing folded away on the second: it toggles.
+        send(&mut reedline, ReedlineEvent::MenuDown);
+        assert_eq!(state(&reedline), rows(&["shown"]));
+        send(&mut reedline, ReedlineEvent::MenuPreview);
+        assert_eq!(state(&reedline), None, "hidden, with no unfolded step");
     }
 
     fn insert(reedline: &mut Reedline, c: char) {
@@ -8112,304 +8587,6 @@ mod tests {
                 ReedlineEvent::Edit(vec![EditCommand::InsertChar(c)]),
             )
             .unwrap();
-    }
-
-    /// A character that cannot extend the word ends the menu opened for it;
-    /// one that can leaves the menu to refilter.
-    #[rstest]
-    #[case::space(' ', true)]
-    #[case::statement_end(';', true)]
-    #[case::close_paren(')', true)]
-    #[case::letter('e', false)]
-    #[case::underscore('_', false)]
-    #[case::qualifier('.', false)]
-    fn a_word_boundary_closes_the_menu(#[case] typed: char, #[case] closes: bool) {
-        let mut reedline = engine_with_word_bounded_menu("_.", false);
-        insert(&mut reedline, typed);
-        assert_eq!(!menu_is_active(&reedline), closes, "inserting {typed:?}");
-    }
-
-    /// A newline ends the word however it arrives: the default `Alt+Enter`
-    /// and `Shift+Enter` bindings emit `InsertNewline`, not `InsertChar`, and
-    /// a menu that outlived it would hold `Enter` on the next line of a
-    /// multi-line statement.
-    #[test]
-    fn a_newline_command_closes_the_menu() {
-        let mut reedline = engine_with_word_bounded_menu("_.", false);
-        reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
-            )
-            .unwrap();
-        assert!(!menu_is_active(&reedline));
-    }
-
-    /// The word characters are the caller's to choose: a path completer keeps
-    /// its menu across the separators an identifier completer ends on.
-    #[rstest]
-    #[case::path_separator('/', false)]
-    #[case::dash('-', false)]
-    #[case::space(' ', true)]
-    fn word_chars_decide_where_the_word_ends(#[case] typed: char, #[case] closes: bool) {
-        let mut reedline = engine_with_word_bounded_menu("_-./", false);
-        insert(&mut reedline, typed);
-        assert_eq!(!menu_is_active(&reedline), closes, "inserting {typed:?}");
-    }
-
-    /// Left unset, a menu still lives for the rest of the line.
-    #[rstest]
-    #[case::space(' ')]
-    #[case::statement_end(';')]
-    fn a_menu_without_word_chars_outlives_the_word(#[case] typed: char) {
-        let mut reedline = engine_with_active_menu(false, false);
-        insert(&mut reedline, typed);
-        assert!(menu_is_active(&reedline), "inserting {typed:?}");
-    }
-
-    /// A persistent menu is persistent: the word ending does not close it.
-    #[test]
-    fn a_persistent_menu_survives_the_end_of_the_word() {
-        let mut reedline = engine_with_word_bounded_menu("_.", true);
-        insert(&mut reedline, ';');
-        assert!(menu_is_active(&reedline));
-    }
-
-    /// Only typing ends a word. Text arriving whole — a paste, a macro — is
-    /// not the user walking off the end of the completion.
-    #[test]
-    fn inserted_text_does_not_end_the_word() {
-        let mut reedline = engine_with_word_bounded_menu("_.", false);
-        reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Edit(vec![EditCommand::InsertString(String::from("is; "))]),
-            )
-            .unwrap();
-        assert!(menu_is_active(&reedline));
-    }
-
-    /// A menu that filters on whole command lines rather than a word — the
-    /// history menu `examples/demo.rs` pairs with the completion menu — has no
-    /// word to end, and is left alone while its neighbour closes.
-    #[test]
-    fn a_menu_without_word_chars_is_left_alone() {
-        let mut reedline = Reedline::create()
-            .with_menu(ReedlineMenu::EngineCompleter(Box::new(
-                ColumnarMenu::default()
-                    .with_name("completion_menu")
-                    .with_word_chars("_."),
-            )))
-            .with_menu(ReedlineMenu::HistoryMenu(Box::new(
-                ListMenu::default().with_name("history_menu"),
-            )));
-        let prompt = DefaultPrompt::default();
-
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("git"))]);
-        reedline
-            .handle_event(&prompt, ReedlineEvent::Menu(String::from("history_menu")))
-            .unwrap();
-        assert!(menu_is_active(&reedline));
-
-        insert(&mut reedline, ' ');
-
-        assert!(
-            menu_is_active(&reedline),
-            "a history search is a line, not a word"
-        );
-    }
-
-    /// The space that ends a word also triggers abbreviation expansion, which
-    /// returns out of the edit before the menu is looked at again. The word
-    /// ends first, so the menu does not outlive the expansion.
-    #[test]
-    fn an_abbreviation_expanded_on_the_space_still_ends_the_word() {
-        let mut reedline = engine_with_word_bounded_menu("_.", false)
-            .with_abbreviations(HashMap::from([(String::from("th"), String::from("there"))]));
-
-        insert(&mut reedline, ' ');
-
-        assert_eq!(reedline.editor.get_buffer(), "there ");
-        assert!(!menu_is_active(&reedline), "the space ended the word");
-    }
-
-    /// A completer that counts how often it is asked.
-    struct CountingCompleter {
-        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl Completer for CountingCompleter {
-        fn complete(&mut self, _line: &str, _pos: usize) -> CompletionResult {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            CompletionResult::fresh(Vec::new())
-        }
-    }
-
-    /// The character that ends the word closes the menu before anything asks
-    /// the completer to refilter it: the answer would be thrown away.
-    #[test]
-    fn the_completer_is_not_asked_about_a_word_that_has_ended() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default()
-                .with_name("completion_menu")
-                .with_word_chars("_."),
-        ));
-        let mut reedline = Reedline::create()
-            .with_completer(Box::new(CountingCompleter {
-                calls: Arc::clone(&calls),
-            }))
-            .with_menu(completion_menu)
-            .with_quick_completions(true);
-        let prompt = DefaultPrompt::default();
-
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        reedline
-            .handle_event(
-                &prompt,
-                ReedlineEvent::Menu(String::from("completion_menu")),
-            )
-            .unwrap();
-        calls.store(0, Ordering::Relaxed);
-
-        insert(&mut reedline, ' ');
-
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        assert!(!menu_is_active(&reedline));
-    }
-
-    /// Typed fast enough, the rest of a statement arrives as one `Edit` of
-    /// several `InsertChar`s. The word still ends inside it.
-    #[test]
-    fn a_word_ends_inside_a_burst_of_typing() {
-        let mut reedline = engine_with_word_bounded_menu("_.", false);
-
-        reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Edit(vec![
-                    EditCommand::InsertChar('i'),
-                    EditCommand::InsertChar('s'),
-                    EditCommand::InsertChar(';'),
-                    EditCommand::InsertChar(' '),
-                ]),
-            )
-            .unwrap();
-
-        assert!(!menu_is_active(&reedline), "the ';' ended the word");
-    }
-
-    /// A completer that always has something to offer, the way a grammar-driven
-    /// SQL completer suggests next-statement keywords after a ';'. A menu fed by
-    /// one of these is never empty, so nothing but the end of the word takes its
-    /// claim on `Enter` away.
-    struct AlwaysSuggests;
-
-    impl Completer for AlwaysSuggests {
-        fn complete(&mut self, _line: &str, pos: usize) -> CompletionResult {
-            CompletionResult::fresh(vec![Suggestion {
-                value: String::from("table"),
-                span: Span {
-                    start: pos,
-                    end: pos,
-                },
-                ..Default::default()
-            }])
-        }
-    }
-
-    /// The report this comes from, byte for byte: `show tab`, Tab to open the
-    /// menu, then `les;` and Enter. The ';' ends the word, so Enter runs the
-    /// statement instead of appending the highlighted "table" to it.
-    #[test]
-    fn the_end_of_a_word_returns_enter_to_the_line() {
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default()
-                .with_name("completion_menu")
-                .with_word_chars("_."),
-        ));
-        let mut reedline = Reedline::create()
-            .with_completer(Box::new(AlwaysSuggests))
-            .with_menu(completion_menu);
-        reedline.painter.force_prompt_anchored_for_test(0);
-        let prompt = DefaultPrompt::default();
-
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("show tab"))]);
-        reedline
-            .handle_event(
-                &prompt,
-                ReedlineEvent::Menu(String::from("completion_menu")),
-            )
-            .unwrap();
-        assert!(menu_is_active(&reedline));
-
-        for c in "les;".chars() {
-            insert(&mut reedline, c);
-        }
-        assert!(!menu_is_active(&reedline), "';' ends the word");
-
-        let status = reedline
-            .handle_event(&prompt, ReedlineEvent::Enter)
-            .unwrap();
-        assert!(
-            matches!(status, EventStatus::Exits(Signal::Success(ref s)) if s == "show tables;"),
-            "the statement runs with no stray word appended"
-        );
-    }
-
-    /// Engine with a completion menu open over "th" and partial completions on, so
-    /// `MenuNext` reaches the completer through `can_partially_complete`.
-    fn engine_with_partial_completion_menu() -> Reedline {
-        let completer = Box::new(DefaultCompleter::new_with_wordlen(
-            vec![String::from("this"), String::from("that")],
-            1,
-        ));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        ));
-        let mut reedline = Reedline::create()
-            .with_completer(completer)
-            .with_menu(completion_menu)
-            .with_partial_completions(true);
-
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        reedline
-            .handle_event(
-                &DefaultPrompt::default(),
-                ReedlineEvent::Menu(String::from("completion_menu")),
-            )
-            .unwrap();
-        assert!(menu_is_active(&reedline));
-        reedline
-    }
-
-    /// The anchor cache exists to keep `cursor::position()` off the hot path (#1090),
-    /// so an event may only spend that round-trip when it actually runs a host
-    /// completer. Which events those are does not follow from whether the menu's
-    /// selection moved: `MenuNext` splices a partial completion first, `MenuPrevious`
-    /// does not. See #1130.
-    #[rstest]
-    #[case::next_queries_the_completer(ReedlineEvent::MenuNext, false)]
-    #[case::previous_only_moves(ReedlineEvent::MenuPrevious, true)]
-    fn menu_events_invalidate_the_anchor_only_when_they_query(
-        #[case] event: ReedlineEvent,
-        #[case] stays_verified: bool,
-    ) {
-        let mut reedline = engine_with_partial_completion_menu();
-        reedline.painter.force_prompt_anchored_for_test(0);
-
-        reedline
-            .handle_event(&DefaultPrompt::default(), event)
-            .unwrap();
-
-        assert_eq!(
-            reedline.painter.prompt_anchor_is_verified_for_test(),
-            stays_verified
-        );
     }
 
     fn send_edit(reedline: &mut Reedline, command: EditCommand) {
@@ -8846,60 +9023,6 @@ mod tests {
         assert_eq!(reedline.current_buffer_contents(), "abc");
     }
 
-    #[rstest]
-    #[case(false, false)]
-    #[case(false, true)]
-    #[case(true, false)]
-    #[case(true, true)]
-    fn test_menu_persistence_while_erasing(#[case] quick: bool, #[case] persistent: bool) {
-        let mut reedline = engine_with_active_menu(quick, persistent);
-
-        // quick completions close the menu on any backspace unless menus are persistent
-        send_edit(&mut reedline, EditCommand::Backspace);
-        assert_eq!(reedline.current_buffer_contents(), "t");
-        assert_eq!(menu_is_active(&reedline), persistent || !quick);
-
-        // emptying the buffer closes the menu unless menus are persistent
-        send_edit(&mut reedline, EditCommand::Backspace);
-        assert!(reedline.current_buffer_contents().is_empty());
-        assert_eq!(menu_is_active(&reedline), persistent);
-    }
-
-    #[rstest]
-    #[case(EditCommand::BackspaceWord)]
-    #[case(EditCommand::MoveToLineStart { select: false })]
-    fn test_menu_persistence_covers_all_quick_dismissal_commands(#[case] command: EditCommand) {
-        for persistent in [false, true] {
-            let mut reedline = engine_with_active_menu(true, persistent);
-            send_edit(&mut reedline, command.clone());
-            assert_eq!(menu_is_active(&reedline), persistent);
-        }
-    }
-
-    #[rstest]
-    #[case(EditCommand::MoveToLineStart { select: false }, true)]
-    #[case(EditCommand::MoveLeft { select: false }, false)]
-    #[case(EditCommand::MoveLineUp { select: false }, false)]
-    #[case(EditCommand::MoveLineDown { select: false }, false)]
-    fn noop_moves_only_dismiss_eligible_quick_menus(
-        #[case] command: EditCommand,
-        #[case] can_dismiss: bool,
-        #[values(false, true)] quick: bool,
-        #[values(false, true)] persistent: bool,
-    ) {
-        let mut reedline = engine_with_active_menu(quick, persistent);
-        reedline.run_edit_commands(&[EditCommand::MoveToLineStart { select: false }]);
-        assert!(menu_is_active(&reedline));
-
-        let status = send(&mut reedline, ReedlineEvent::Edit(vec![command]));
-
-        let dismissed = can_dismiss && quick && !persistent;
-        assert_eq!(menu_is_active(&reedline), !dismissed);
-        assert_eq!(matches!(status, EventStatus::Handled), dismissed);
-        assert_eq!(reedline.current_buffer_contents(), "th");
-        assert_eq!(reedline.editor.insertion_point(), 0);
-    }
-
     fn send(reedline: &mut Reedline, event: ReedlineEvent) -> EventStatus {
         reedline
             .handle_event(&DefaultPrompt::default(), event)
@@ -8939,172 +9062,6 @@ mod tests {
         assert_eq!(reedline.current_buffer_contents(), "");
     }
 
-    /// Engine with a completion menu opened over "th" by a completer that has no
-    /// word starting with it, so the menu is active but holds no values.
-    fn engine_with_empty_menu() -> Reedline {
-        let completer = Box::new(DefaultCompleter::new_with_wordlen(
-            vec![String::from("xylophone")],
-            1,
-        ));
-        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        ));
-        let mut reedline = Reedline::create()
-            .with_completer(completer)
-            .with_menu(completion_menu)
-            .with_quick_completions(true);
-
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        send(
-            &mut reedline,
-            ReedlineEvent::Menu(String::from("completion_menu")),
-        );
-        assert!(menu_is_active(&reedline), "setup");
-        assert!(reedline.menus[0].get_values().is_empty(), "setup");
-        reedline
-    }
-
-    #[test]
-    fn menu_accept_splices_the_selection_and_closes_the_menu() {
-        let mut reedline = engine_with_active_menu(true, false);
-
-        let status = send(&mut reedline, ReedlineEvent::MenuAccept);
-
-        assert!(matches!(status, EventStatus::Handled));
-        assert_eq!(reedline.current_buffer_contents(), "that");
-        assert!(!menu_is_active(&reedline));
-    }
-
-    #[test]
-    fn menu_accept_without_an_open_menu_is_inapplicable() {
-        let mut reedline = Reedline::create();
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-
-        let status = send(&mut reedline, ReedlineEvent::MenuAccept);
-
-        assert!(matches!(status, EventStatus::Inapplicable));
-        assert_eq!(reedline.current_buffer_contents(), "th");
-    }
-
-    /// Nothing to splice, so the keypress is not spent on closing the menu; the
-    /// event falls through to whatever the binding lists next.
-    #[test]
-    fn menu_accept_over_an_empty_menu_is_inapplicable_and_leaves_it_open() {
-        let mut reedline = engine_with_empty_menu();
-
-        let status = send(&mut reedline, ReedlineEvent::MenuAccept);
-
-        assert!(matches!(status, EventStatus::Inapplicable));
-        assert!(menu_is_active(&reedline));
-        assert_eq!(reedline.current_buffer_contents(), "th");
-    }
-
-    /// A *stale* answer is refused downstream — its span belongs to the line it
-    /// was answered from — so there is nothing to splice and the keypress is not
-    /// spent closing the menu over a completion that never happened.
-    #[test]
-    fn menu_accept_over_a_stale_menu_is_inapplicable_and_leaves_it_open() {
-        let (mut reedline, _) = activate_menu_over(
-            Box::new(DeferredCompleter::stale("console", "co", &["crates"])),
-            "cr",
-            true,
-            false,
-        );
-        assert!(menu_is_active(&reedline), "setup");
-        assert!(
-            reedline.menus[0].results_are_provisional(),
-            "setup: the answer is stale"
-        );
-
-        let status = send(&mut reedline, ReedlineEvent::MenuAccept);
-
-        assert!(matches!(status, EventStatus::Inapplicable));
-        assert!(menu_is_active(&reedline));
-        assert_eq!(reedline.current_buffer_contents(), "cr");
-    }
-
-    /// The same refusal seen from `Enter`: the line runs as typed rather than
-    /// the key dying against a menu that could not have accepted anything.
-    #[test]
-    fn enter_over_a_stale_menu_runs_the_line() {
-        let (mut reedline, _) = activate_menu_over(
-            Box::new(DeferredCompleter::stale("console", "co", &["crates"])),
-            "cr",
-            true,
-            false,
-        );
-        reedline.painter.force_prompt_anchored_for_test(0);
-
-        let status = reedline
-            .handle_event(&DefaultPrompt::default(), ReedlineEvent::Enter)
-            .unwrap();
-
-        assert!(
-            matches!(status, EventStatus::Exits(Signal::Success(ref line)) if line == "cr"),
-            "the line ran as typed, with no stale value spliced into it"
-        );
-    }
-
-    /// The binding this exists for: space accepts the highlighted completion and
-    /// then types itself, and stays a plain space when no menu is open.
-    #[test]
-    fn menu_accept_chains_with_an_edit_as_a_space_binding() {
-        let space_binding = || {
-            ReedlineEvent::Multiple(vec![
-                ReedlineEvent::MenuAccept,
-                ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
-            ])
-        };
-
-        let mut reedline = engine_with_active_menu(true, false);
-        send(&mut reedline, space_binding());
-        assert_eq!(reedline.current_buffer_contents(), "that ");
-        assert!(!menu_is_active(&reedline));
-
-        let mut reedline = Reedline::create();
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        send(&mut reedline, space_binding());
-        assert_eq!(reedline.current_buffer_contents(), "th ");
-    }
-
-    /// The same pair under `UntilFound` is "accept, or else type a space": the
-    /// chain stops at the first event that applies, so an accepted completion is
-    /// not followed by the space, and a menu with nothing to accept is skipped
-    /// over like no menu at all.
-    #[test]
-    fn menu_accept_under_until_found_yields_to_the_next_event_only_when_inapplicable() {
-        let space_binding = || {
-            ReedlineEvent::UntilFound(vec![
-                ReedlineEvent::MenuAccept,
-                ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
-            ])
-        };
-
-        let mut reedline = engine_with_active_menu(true, false);
-        send(&mut reedline, space_binding());
-        assert_eq!(reedline.current_buffer_contents(), "that");
-        assert!(!menu_is_active(&reedline));
-
-        let mut reedline = Reedline::create();
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        send(&mut reedline, space_binding());
-        assert_eq!(reedline.current_buffer_contents(), "th ");
-
-        let mut reedline = engine_with_empty_menu();
-        send(&mut reedline, space_binding());
-        assert_eq!(reedline.current_buffer_contents(), "th ");
-    }
-
-    #[test]
-    fn esc_closing_a_menu_is_handled() {
-        let mut reedline = engine_with_active_menu(true, false);
-
-        let status = send(&mut reedline, ReedlineEvent::Esc);
-
-        assert!(matches!(status, EventStatus::Handled));
-        assert!(!menu_is_active(&reedline));
-    }
-
     #[test]
     fn esc_clearing_a_selection_is_handled() {
         let mut reedline = Reedline::create();
@@ -9119,6 +9076,316 @@ mod tests {
         assert_eq!(reedline.current_selection(), None);
     }
 
+    /// A menu's marker is kept for hosts that name one, but the prompt
+    /// indicator stays as it is.
+    #[test]
+    fn the_menu_marker_does_not_replace_the_prompt_indicator() {
+        let mut reedline = engine_over_th_words()
+            .with_menu(ReedlineMenu::new("completion_menu").with_marker("MENU| "));
+        type_text(&mut reedline, "th");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+
+        assert!(highlighted(&reedline).is_some(), "setup: highlighting");
+        assert!(!repaint_output(&mut reedline).contains("MENU|"));
+    }
+
+    /// A panel drawing one row per suggestion, then the rows of the preview,
+    /// then its fold label, which answers clicks by what it drew where. Its
+    /// room for a preview is 10 columns beyond the word.
+    #[derive(Default)]
+    struct Rows {
+        items: usize,
+        preview: usize,
+        fold: bool,
+    }
+
+    impl Panel for Rows {
+        fn render(&mut self, view: &View<'_>) -> Vec<String> {
+            self.items = view.completions.items.len();
+            let shown = view.preview.map(|p| p.shown(view.unfolded).into_owned());
+            self.preview = shown.as_ref().map_or(0, Vec::len);
+            self.fold = view.preview.is_some_and(Preview::is_foldable);
+            let mut rows: Vec<String> = view
+                .completions
+                .items
+                .iter()
+                .map(|item| item.value.clone())
+                .collect();
+            rows.extend(shown.unwrap_or_default());
+            rows.extend(self.fold.then(|| "fold".to_owned()));
+            rows
+        }
+
+        fn hit_at(&self, row: u16, _column: u16) -> Option<Hit> {
+            let row = usize::from(row);
+            if row < self.items {
+                Some(Hit::Item(row))
+            } else if row < self.items + self.preview {
+                Some(Hit::Preview(row - self.items))
+            } else {
+                (self.fold && row == self.items + self.preview).then_some(Hit::Fold)
+            }
+        }
+
+        fn preview_room(&mut self, view: &View<'_>) -> u16 {
+            10 + view.anchor
+        }
+    }
+
+    /// What a [`Clicked`] completer was asked.
+    #[derive(Clone, Default)]
+    struct PreviewLog {
+        widths: Arc<Mutex<Vec<u16>>>,
+        clicks: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    /// A completer of two suggestions whose first preview has a folded part,
+    /// and which answers a click on a preview row with a suggestion.
+    struct Clicked(PreviewLog);
+
+    impl Completer for Clicked {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            Previewing.complete(request, reply);
+        }
+
+        fn preview(
+            &mut self,
+            completions: &Completions,
+            index: usize,
+            width: u16,
+            reply: Reply<Preview>,
+        ) {
+            self.0.widths.lock().unwrap().push(width);
+            Folding.preview(completions, index, width, reply);
+        }
+
+        fn preview_clicked(
+            &mut self,
+            completions: &Completions,
+            index: usize,
+            row: usize,
+        ) -> Option<Suggestion> {
+            self.0.clicks.lock().unwrap().push((index, row));
+            Some(Suggestion {
+                value: "clicked".into(),
+                span: completions.items[index].span,
+                ..Suggestion::default()
+            })
+        }
+    }
+
+    /// An engine with "ab" typed, its menu open on the first of two
+    /// suggestions and painted, whose panel is [`Rows`]. The panel starts on
+    /// screen row 1, under the line.
+    fn engine_with_clickable_panel() -> (Reedline, PreviewLog) {
+        let log = PreviewLog::default();
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(Clicked(log.clone())))
+            .with_panel(Box::<Rows>::default())
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        reedline.painter = Painter::new(W::capture());
+        reedline.painter.force_prompt_anchored_for_test(0);
+        type_text(&mut reedline, "ab");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        repaint(&mut reedline);
+        (reedline, log)
+    }
+
+    /// A paint, under a prompt of one row wherever the tests run: the default one shows the
+    /// working directory, which a long one wraps.
+    fn repaint(reedline: &mut Reedline) {
+        reedline.repaint(&short_prompt()).unwrap();
+    }
+
+    /// A mouse event at screen `row`, then a repaint as the read loop does.
+    fn mouse(reedline: &mut Reedline, row: u16, button: MouseButton) {
+        send(
+            reedline,
+            ReedlineEvent::Mouse {
+                column: 0,
+                row,
+                button,
+            },
+        );
+        repaint(reedline);
+    }
+
+    #[test]
+    fn a_click_selects_a_row_and_a_click_on_the_selected_row_takes_it() {
+        let (mut reedline, _) = engine_with_clickable_panel();
+        assert_eq!(highlighted(&reedline), Some("ab!"));
+
+        mouse(&mut reedline, 2, MouseButton::Left);
+        assert_eq!(highlighted(&reedline), Some("ab?"));
+        assert_eq!(reedline.current_buffer_contents(), "ab", "only highlighted");
+
+        mouse(&mut reedline, 2, MouseButton::Left);
+        assert_eq!(reedline.current_buffer_contents(), "ab?");
+        assert!(!completions_open(&reedline));
+    }
+
+    #[test]
+    fn a_first_click_on_the_highlighted_row_selects_and_a_second_takes_it() {
+        let (mut reedline, _) = engine_with_clickable_panel();
+        assert_eq!(highlighted(&reedline), Some("ab!"));
+
+        mouse(&mut reedline, 1, MouseButton::Left);
+        assert!(completions_open(&reedline), "one click does not take it");
+        assert_eq!(reedline.current_buffer_contents(), "ab");
+        mouse(&mut reedline, 1, MouseButton::Left);
+        assert_eq!(reedline.current_buffer_contents(), "ab!");
+        assert!(!completions_open(&reedline));
+    }
+
+    #[test]
+    fn a_wheel_turn_that_moves_nothing_does_not_repaint() {
+        let (mut reedline, _) = engine_with_clickable_panel();
+        let wheel = |reedline: &mut Reedline, button| {
+            let event = ReedlineEvent::Mouse {
+                column: 0,
+                row: 1,
+                button,
+            };
+            reedline
+                .handle_event(&DefaultPrompt::default(), event)
+                .unwrap()
+        };
+        // At the first row of the list, up moves nothing; down does.
+        assert!(matches!(
+            wheel(&mut reedline, MouseButton::ScrollUp),
+            EventStatus::Inapplicable
+        ));
+        assert!(matches!(
+            wheel(&mut reedline, MouseButton::ScrollDown),
+            EventStatus::Handled
+        ));
+        assert!(matches!(
+            wheel(&mut reedline, MouseButton::ScrollDown),
+            EventStatus::Inapplicable
+        ));
+    }
+
+    #[test]
+    fn the_wheel_moves_the_highlight_without_wrapping() {
+        let (mut reedline, _) = engine_with_clickable_panel();
+
+        mouse(&mut reedline, 1, MouseButton::ScrollDown);
+        assert_eq!(highlighted(&reedline), Some("ab?"));
+        mouse(&mut reedline, 1, MouseButton::ScrollDown);
+        assert_eq!(highlighted(&reedline), Some("ab?"), "it stops at the end");
+        mouse(&mut reedline, 1, MouseButton::ScrollUp);
+        assert_eq!(highlighted(&reedline), Some("ab!"));
+
+        // While the panel is open the wheel is its own wherever the pointer is, so that it never
+        // scrolls the terminal behind it.
+        mouse(&mut reedline, 30, MouseButton::ScrollDown);
+        assert_eq!(
+            highlighted(&reedline),
+            Some("ab?"),
+            "off the panel it still moves the highlight"
+        );
+        mouse(&mut reedline, 30, MouseButton::ScrollDown);
+        assert_eq!(highlighted(&reedline), Some("ab?"), "and stops at the end");
+    }
+
+    #[test]
+    fn the_fold_label_toggles_the_fold_and_a_preview_row_is_the_completers() {
+        let (mut reedline, log) = engine_with_clickable_panel();
+        let shown = |reedline: &Reedline| reedline.completion.unfolded();
+        // Rows: two suggestions, the one preview row, then the label.
+        assert!(!shown(&reedline));
+
+        mouse(&mut reedline, 4, MouseButton::Left);
+        assert!(shown(&reedline), "unfolded");
+        mouse(&mut reedline, 5, MouseButton::Left);
+        assert!(!shown(&reedline), "folded again");
+
+        mouse(&mut reedline, 3, MouseButton::Left);
+        assert_eq!(*log.clicks.lock().unwrap(), [(0, 0)]);
+        assert_eq!(reedline.current_buffer_contents(), "clicked");
+    }
+
+    /// Previews 30 rows of each suggestion of [`Previewing`].
+    struct Tall;
+
+    impl Completer for Tall {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            Previewing.complete(request, reply);
+        }
+
+        fn preview(&mut self, _: &Completions, _: usize, _: u16, reply: Reply<Preview>) {
+            reply.send(
+                (0..30)
+                    .map(|row| row.to_string())
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_wheel_over_the_preview_scrolls_it_and_alt_arrows_do_too() {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(Tall))
+            .with_panel(Box::<Rows>::default())
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        reedline.painter = Painter::new(W::capture());
+        reedline.painter.force_prompt_anchored_for_test(0);
+        type_text(&mut reedline, "ab");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        repaint(&mut reedline);
+        assert_eq!(highlighted(&reedline), Some("ab!"));
+
+        // Rows 1 and 2 are the suggestions, and the preview starts on row 3.
+        mouse(&mut reedline, 3, MouseButton::ScrollDown);
+        assert_eq!(reedline.completion.preview_offset(), 3);
+        assert_eq!(highlighted(&reedline), Some("ab!"), "the selection stays");
+
+        send(&mut reedline, ReedlineEvent::PreviewDown);
+        assert!(reedline.completion.preview_offset() > 3);
+        send(&mut reedline, ReedlineEvent::PreviewUp);
+        send(&mut reedline, ReedlineEvent::PreviewUp);
+        assert_eq!(reedline.completion.preview_offset(), 0);
+    }
+
+    #[test]
+    fn the_mouse_is_reported_only_while_the_panel_is_open() {
+        let (mut reedline, _) = engine_with_clickable_panel();
+        assert!(reedline.mouse.is_on());
+
+        // A click outside the panel closes it, and so ends the reporting.
+        mouse(&mut reedline, 30, MouseButton::Left);
+        assert!(!completions_open(&reedline));
+        assert!(!reedline.mouse.is_on());
+
+        // So does Esc, or leaving the read.
+        let (mut reedline, _) = engine_with_clickable_panel();
+        send(&mut reedline, ReedlineEvent::Esc);
+        send(&mut reedline, ReedlineEvent::Esc);
+        repaint(&mut reedline);
+        assert!(!reedline.mouse.is_on());
+        let (mut reedline, _) = engine_with_clickable_panel();
+        send(&mut reedline, ReedlineEvent::CtrlC);
+        reedline.mouse.set(false);
+        assert!(!reedline.mouse.is_on());
+    }
+
+    #[test]
+    fn a_preview_is_asked_for_at_the_width_the_panel_has_room_for() {
+        let (_, log) = engine_with_clickable_panel();
+        let widths = log.widths.lock().unwrap().clone();
+        // First at the room with the word at column 0, then again once the
+        // paint showed the word starts after the prompt.
+        assert_eq!(widths.first(), Some(&10));
+        let last = *widths.last().expect("asked");
+        assert!(last > 10, "{widths:?}");
+        assert_eq!(widths.len(), 2, "{widths:?}");
+    }
+
     #[test]
     fn esc_with_nothing_to_cancel_is_inapplicable() {
         let mut reedline = Reedline::create();
@@ -9128,28 +9395,6 @@ mod tests {
 
         assert!(matches!(status, EventStatus::Inapplicable));
         assert_eq!(reedline.current_buffer_contents(), "th");
-    }
-
-    /// Esc can fall back to a custom action: it closes an open menu, and only
-    /// with nothing to cancel does the chain move on to the next event.
-    #[test]
-    fn esc_under_until_found_yields_to_the_next_event_only_when_inapplicable() {
-        let esc_binding = || {
-            ReedlineEvent::UntilFound(vec![
-                ReedlineEvent::Esc,
-                ReedlineEvent::Edit(vec![EditCommand::Clear]),
-            ])
-        };
-
-        let mut reedline = engine_with_active_menu(true, false);
-        send(&mut reedline, esc_binding());
-        assert!(!menu_is_active(&reedline));
-        assert_eq!(reedline.current_buffer_contents(), "th");
-
-        let mut reedline = Reedline::create();
-        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
-        send(&mut reedline, esc_binding());
-        assert_eq!(reedline.current_buffer_contents(), "");
     }
 
     /// A hinter that always offers a fixed suggestion, so the completion flow can
@@ -9223,7 +9468,12 @@ mod tests {
         rl.run_edit_commands(&[EditCommand::InsertString("echo ".into())]);
         rl.repaint(&DefaultPrompt::default()).unwrap();
         let painted = String::from_utf8_lossy(rl.painter.captured_for_test()).into_owned();
-        assert!(painted.contains("a\r\n::: b"), "no indicator: {painted:?}");
+        // Each row is erased before it is written, so the indicator follows
+        // the erase that starts the hint's second row.
+        assert!(
+            painted.contains("a\r\n\r\x1b[K::: b"),
+            "no indicator: {painted:?}"
+        );
 
         send(&mut rl, ReedlineEvent::HistoryHintComplete);
         assert_eq!(rl.current_buffer_contents(), "echo a\nb");
@@ -9566,30 +9816,6 @@ mod tests {
         rl.hide_hints = true;
         rl.repaint(&DefaultPrompt::default()).unwrap();
         assert!(keeps_the_closer(&rl), "hints hidden");
-    }
-
-    // An open menu owns the area under the cursor and the painter draws no
-    // hint with it, so the closers must stay in the line, not be left to a
-    // hint that never shows.
-    #[test]
-    fn open_menu_keeps_trailing_closers_out_of_the_hint() {
-        let (mut rl, asked) = paired_line_with_hint("(gs", "tat).branch", Some(&[3]));
-        rl = rl.with_menu(ReedlineMenu::HistoryMenu(Box::new(
-            ListMenu::default().with_name("history_menu"),
-        )));
-        rl.handle_event(
-            &DefaultPrompt::default(),
-            ReedlineEvent::Menu("history_menu".into()),
-        )
-        .unwrap();
-        assert!(menu_is_active(&rl), "setup: menu is open");
-
-        let output = repaint_output(&mut rl);
-        assert_eq!(*asked.lock().unwrap(), ("(gs)".to_string(), 3));
-        assert!(output.contains(')'), "closers dropped: {output:?}");
-
-        accept_hint(&mut rl, true);
-        assert_eq!(buffer_and_cursor(&rl), ("(gs)", 3));
     }
 
     #[test]
@@ -9963,17 +10189,39 @@ mod tests {
         assert_eq!(repaint_output_on(&mut rl, 24).contains(STATUS_TEXT), shown);
     }
 
-    // A buffer filling the screen leaves no row for the status line, so the
-    // host is not asked for text that would be thrown away.
+    /// A panel with nothing to draw but a hint, the description of the
+    /// selected suggestion.
+    struct Describing;
+
+    impl Panel for Describing {
+        fn render(&mut self, _view: &View<'_>) -> Vec<String> {
+            vec!["rows".to_owned()]
+        }
+
+        fn hint(&mut self, view: &View<'_>) -> Option<String> {
+            let item = view.completions.items.get(view.selected?)?;
+            Some(format!("  about {}", item.value))
+        }
+    }
+
+    // The panel's hint goes on the status line, in place of the status while a suggestion is
+    // walked through.
     #[test]
-    fn status_line_is_not_asked_for_without_a_row_to_draw_it() {
-        let (mut rl, asked) = engine_with_status_line();
-        let before = asked.load(std::sync::atomic::Ordering::Relaxed);
+    fn the_panels_hint_takes_the_place_of_the_status() {
+        let mut rl = Reedline::create()
+            .with_completer(Box::new(Previewing))
+            .with_panel(Box::new(Describing))
+            .with_status_line(Box::new(CountingStatus(Arc::default())))
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        type_text(&mut rl, "ab");
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
 
-        let output = repaint_output_on(&mut rl, 1);
+        let painted = crate::painting::strip_ansi(&repaint_output_on(&mut rl, 24));
 
-        assert!(!output.contains(STATUS_TEXT));
-        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before);
+        assert!(painted.contains("  about ab!"), "{painted:?}");
+        assert!(!painted.contains(STATUS_TEXT), "{painted:?}");
     }
 
     #[test]
@@ -9989,58 +10237,1876 @@ mod tests {
         assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
-    // Sixty completions in four columns make a grid of 15 rows, taller than
-    // the screen. It is cut to the 7 rows below the status line, rather than
-    // take them back and paint as a large buffer, which draws no status line.
-    #[test]
-    fn status_line_stays_above_a_columnar_menu_taller_than_the_screen() {
-        let words = (0..60).map(|index| format!("ls{index:02}")).collect();
-        let (rl, _) = engine_with_status_line();
-        // Plain, so each entry reaches the output in one piece.
-        let mut rl = rl
-            .with_ansi_colors(false)
-            .with_completer(Box::new(DefaultCompleter::new(words)))
-            .with_menu(ReedlineMenu::EngineCompleter(Box::new(
-                ColumnarMenu::default().with_name("completion_menu"),
-            )));
-        rl.handle_event(
-            &DefaultPrompt::default(),
-            ReedlineEvent::Menu("completion_menu".to_string()),
-        )
-        .expect("menu opens");
+    /// What a [`Seen`] panel was last given to list.
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<String>>>);
 
-        let output = repaint_output_on(&mut rl, 10);
-
-        assert!(output.contains(STATUS_TEXT));
-        assert!(output.contains("ls27"));
-        assert!(!output.contains("ls28"));
+    impl Panel for Seen {
+        fn render(&mut self, view: &View<'_>) -> Vec<String> {
+            let values: Vec<String> = view
+                .completions
+                .items
+                .iter()
+                .map(|item| item.value.clone())
+                .collect();
+            *self.0.lock().unwrap() = values.clone();
+            values
+        }
     }
 
-    /// An open menu hides the hint, so a hint wrapping over rows must not
-    /// shorten the menu cut below the status line.
+    /// What one paint showed of completion: how, the list when it was a list,
+    /// and the virtual text when it was that.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Scene {
+        drawn: Drawn,
+        list: Vec<String>,
+        ghost: Option<String>,
+    }
+
+    /// An engine over `words` whose completer answers only when told to, as
+    /// one working on another thread does, with passive completions and a
+    /// panel that records what it lists.
+    struct Late {
+        reedline: Reedline,
+        parked: Parked,
+        seen: Seen,
+        words: Vec<&'static str>,
+        /// What was drawn before the last key.
+        last: Drawn,
+    }
+
+    impl Late {
+        fn new(words: &[&'static str]) -> Self {
+            let parked = Parked::default();
+            let seen = Seen::default();
+            let mut reedline = Reedline::create()
+                .with_completer(Box::new(parked.clone()))
+                .with_panel(Box::new(seen.clone()))
+                .with_passive_completions(true);
+            reedline.painter = Painter::new(W::capture());
+            reedline.painter.force_prompt_anchored_for_test(0);
+            Self {
+                reedline,
+                parked,
+                seen,
+                words: words.to_vec(),
+                last: Drawn::Nothing,
+            }
+        }
+
+        /// Paints and reports what was drawn.
+        fn paint(&mut self) -> Scene {
+            self.seen.0.lock().unwrap().clear();
+            repaint(&mut self.reedline);
+            let drawn = self.reedline.completion.drawn();
+            Scene {
+                drawn,
+                list: self.seen.0.lock().unwrap().clone(),
+                ghost: self
+                    .reedline
+                    .completion
+                    .lone(&self.reedline.editor)
+                    .map(|(text, _)| text)
+                    .filter(|_| drawn == Drawn::Ghost),
+            }
+        }
+
+        /// Answers the newest request with the words that start the word at the
+        /// cursor, and drops the older ones.
+        fn answer(&mut self) {
+            let mut parcels: Vec<_> = std::mem::take(&mut *self.parked.0.lock().unwrap());
+            let Some((line, reply)) = parcels.pop() else {
+                return;
+            };
+            let start = line.rfind(' ').map_or(0, |at| at + 1);
+            let items: Vec<Suggestion> = self
+                .words
+                .iter()
+                .filter(|word| !line[start..].is_empty() && word.starts_with(&line[start..]))
+                .map(|word| Suggestion {
+                    value: (*word).to_owned(),
+                    span: Span::new(start, line.len()),
+                    ..Suggestion::default()
+                })
+                .collect();
+            reply.send(items.into());
+        }
+
+        /// Presses `event`, paints with the answer still on its way, then
+        /// answers and paints again. Returns both paints.
+        fn press(&mut self, event: ReedlineEvent) -> [Scene; 2] {
+            send(&mut self.reedline, event);
+            let waiting = self.paint();
+            self.answer();
+            let answered = self.paint();
+            self.last = answered.drawn;
+            [waiting, answered]
+        }
+
+        fn type_char(&mut self, c: char) -> [Scene; 2] {
+            self.press(ReedlineEvent::Edit(vec![EditCommand::InsertChar(c)]))
+        }
+
+        fn backspace(&mut self) -> [Scene; 2] {
+            self.press(ReedlineEvent::Edit(vec![EditCommand::Backspace]))
+        }
+    }
+
+    /// How many times the drawn mode changed across the paints of one key,
+    /// counted from what was drawn before it.
+    fn mode_changes(before: Drawn, [waiting, answered]: &[Scene; 2]) -> usize {
+        usize::from(before != waiting.drawn) + usize::from(waiting.drawn != answered.drawn)
+    }
+
     #[test]
-    fn columnar_menu_below_the_status_line_ignores_the_hidden_hint() {
-        let words = (0..60).map(|index| format!("ls{index:02}")).collect();
-        let hint: &'static str = "x".repeat(200).leak();
-        let (rl, _) = engine_with_status_line();
-        let mut rl = rl
-            .with_ansi_colors(false)
-            .with_hinter(Box::new(FixedHinter(hint)))
-            .with_completer(Box::new(DefaultCompleter::new(words)))
-            .with_menu(ReedlineMenu::EngineCompleter(Box::new(
-                ColumnarMenu::default().with_name("completion_menu"),
-            )));
-        rl.handle_event(
-            &DefaultPrompt::default(),
-            ReedlineEvent::Menu("completion_menu".to_string()),
+    fn typing_on_never_lists_what_no_longer_matches_while_the_answer_is_late() {
+        let mut late = Late::new(&["crates", "cargo", "cabal", "crane"]);
+        late.type_char('c');
+        let [waiting, answered] = late.type_char('r');
+
+        // `cargo` and `cabal` were shown for `c`: not for `cr`, answer or no.
+        assert_eq!(waiting.list, ["crates", "crane"]);
+        assert_eq!(waiting.list, answered.list);
+
+        let [waiting, answered] = late.type_char('a');
+        assert_eq!(waiting.list, answered.list, "narrowed, then confirmed");
+        let [waiting, answered] = late.type_char('t');
+        assert_eq!(waiting.ghost.as_deref(), Some("es"), "one left, at once");
+        assert_eq!(waiting, answered);
+    }
+
+    #[test]
+    fn backspacing_changes_what_is_drawn_at_most_once_per_key() {
+        let words = [
+            &["crates", "cargo", "cabal", "cd", "cdn"][..],
+            &["crates", "cargo", "cabal", "crane", "cd"][..],
+            &["crates"][..],
+        ];
+        for words in words {
+            for typed in ["cd crate", "cd cr", "crate", "cd ca"] {
+                let mut late = Late::new(words);
+                for c in typed.chars() {
+                    let before = late.last;
+                    let scenes = late.type_char(c);
+                    assert!(
+                        mode_changes(before, &scenes) <= 1,
+                        "{words:?} typing {c} of {typed:?}: {before:?} then {scenes:?}"
+                    );
+                }
+                for _ in typed.chars() {
+                    let before = late.last;
+                    let scenes = late.backspace();
+                    let line = late.reedline.current_buffer_contents().to_owned();
+                    assert!(
+                        mode_changes(before, &scenes) <= 1,
+                        "{words:?} backspacing {typed:?} to {line:?}: {before:?} then {scenes:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_word_backspaced_empty_shows_no_list_of_the_word_that_was() {
+        let mut late = Late::new(&["crates", "cargo", "cabal"]);
+        for c in "cd c".chars() {
+            late.type_char(c);
+        }
+        assert_eq!(late.last, Drawn::Panel);
+
+        // The answer for `c` is not drawn once nothing is left of the word.
+        let [waiting, _] = late.backspace();
+        assert_eq!(late.reedline.current_buffer_contents(), "cd ");
+        assert_eq!(waiting.drawn, Drawn::Nothing);
+        assert!(waiting.list.is_empty());
+    }
+
+    #[test]
+    fn a_lone_ghost_is_kept_across_backspaces_to_a_word_it_still_continues() {
+        let mut late = Late::new(&["crates"]);
+        for c in "crate".chars() {
+            late.type_char(c);
+        }
+        for (rest, line) in [
+            ("es", "crat"),
+            ("tes", "cra"),
+            ("ates", "cr"),
+            ("rates", "c"),
+        ] {
+            let [waiting, answered] = late.backspace();
+            assert_eq!(late.reedline.current_buffer_contents(), line);
+            assert_eq!(waiting.ghost.as_deref(), Some(rest));
+            assert_eq!(waiting, answered, "no flash for {line:?}");
+        }
+    }
+
+    /// An engine over `rl`, painted on a virtual terminal `width` by `height`.
+    fn on_screen(mut rl: Reedline, width: u16, height: u16) -> Reedline {
+        rl.painter = Painter::new(W::screen(width, height));
+        rl.painter
+            .initialize_prompt_position_with_size((width, height), None)
+            .expect("a screen to start on");
+        rl
+    }
+
+    /// A prompt that leaves the screen to what is under test.
+    fn short_prompt() -> DefaultPrompt {
+        DefaultPrompt::new(
+            crate::DefaultPromptSegment::Empty,
+            crate::DefaultPromptSegment::Empty,
         )
-        .expect("menu opens");
+    }
 
-        let output = repaint_output_on(&mut rl, 10);
+    /// Paints `rl` under [`short_prompt`] and returns the rows of the screen.
+    fn screen_rows(rl: &mut Reedline) -> Vec<String> {
+        rl.repaint(&short_prompt()).expect("paints");
+        rl.painter.screen_rows_for_test()
+    }
 
-        assert!(output.contains(STATUS_TEXT));
-        assert!(!output.contains(hint));
-        assert!(output.contains("ls27"));
-        assert!(!output.contains("ls28"));
+    /// What the first cell of a row inside the panel's frame holds, if the row is one.
+    fn framed(row: &str) -> Option<&str> {
+        let inside = row.trim_start().strip_prefix('│')?;
+        Some(inside.split('│').next()?.trim())
+    }
+
+    /// A completer that offers the same suggestions for any line.
+    struct Offers(Vec<Suggestion>);
+
+    impl Completer for Offers {
+        fn complete(&mut self, _: Request<'_>, reply: Reply<Completions>) {
+            reply.send(self.0.clone().into());
+        }
+    }
+
+    /// An engine with passive completions that offers `items`, with `line`
+    /// typed and painted on a 40 by 10 screen.
+    fn engine_offering(line: &str, items: Vec<Suggestion>) -> Reedline {
+        let mut rl = on_screen(
+            Reedline::create()
+                .with_completer(Box::new(Offers(items)))
+                .with_menu(ReedlineMenu::new("completion_menu"))
+                .with_passive_completions(true),
+            40,
+            10,
+        );
+        type_text(&mut rl, line);
+        rl
+    }
+
+    #[test]
+    fn a_highlighted_suggestion_shows_what_taking_it_would_write_after_the_cursor() {
+        let mut rl = on_screen(engine_over_th_words(), 40, 10);
+        type_text(&mut rl, "th");
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
+
+        assert_eq!(
+            rl.current_buffer_contents(),
+            "th",
+            "the line is not changed"
+        );
+        assert_eq!(highlighted(&rl), Some("that"));
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("that"), "{rows:?}");
+        assert_eq!(rl.completion.drawn(), Drawn::Panel, "beside the list");
+
+        send(&mut rl, ReedlineEvent::MenuNext);
+        assert!(screen_rows(&mut rl)[0].ends_with("this"));
+        assert_eq!(rl.current_buffer_contents(), "th");
+    }
+
+    #[test]
+    fn a_template_is_drawn_whole_after_the_cursor() {
+        let template = Suggestion {
+            value: "each {  }".into(),
+            display_override: Some("each".into()),
+            span: Span::new(5, 8),
+            cursor: Some(12),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("ls | eac", vec![template]);
+
+        assert!(screen_rows(&mut rl)[0].ends_with("ls | each {  }"));
+        assert_eq!(rl.current_buffer_contents(), "ls | eac");
+    }
+
+    #[test]
+    fn a_host_completer_that_offers_a_prefix_shows_it_without_a_space() {
+        let host = Suggestion {
+            value: "root@".into(),
+            span: Span::new(4, 6),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("ssh ro", vec![host]);
+
+        assert!(screen_rows(&mut rl)[0].ends_with("ssh root@"));
+    }
+
+    #[test]
+    fn a_fix_for_a_typo_is_drawn_after_the_cursor_in_place_of_a_list_of_one() {
+        let fix = Suggestion {
+            value: "git".into(),
+            span: Span::new(0, 3),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("gti", vec![fix]);
+
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("gti → git"), "{rows:?}");
+        assert!(rows[1..].iter().all(|row| row.is_empty()), "{rows:?}");
+    }
+
+    #[test]
+    fn a_fuzzy_match_draws_nothing_inline() {
+        let fuzzy = |value: &str| Suggestion {
+            value: value.into(),
+            span: Span::new(4, 7),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("git chk", vec![fuzzy("checkout"), fuzzy("cherry")]);
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
+        send(&mut rl, ReedlineEvent::MenuNext);
+
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("git chk"), "{rows:?}");
+    }
+
+    /// A completer that has a line of `each ` go on with a closure.
+    struct Opens;
+
+    impl Completer for Opens {
+        fn complete(&mut self, _: Request<'_>, reply: crate::Reply<Completions>) {
+            reply.send(Completions::default());
+        }
+
+        fn opening(&mut self, line: &str, pos: usize) -> Option<Opening> {
+            (&line[..pos] == "each ").then(|| Opening {
+                text: "{  }".into(),
+                cursor: 2,
+            })
+        }
+    }
+
+    /// An engine with `each` typed and then the space that opens the closure.
+    fn opened() -> Reedline {
+        let mut rl = on_screen(Reedline::create().with_completer(Box::new(Opens)), 40, 10);
+        type_text(&mut rl, "each");
+        send_edit(&mut rl, EditCommand::InsertChar(' '));
+        rl
+    }
+
+    #[test]
+    fn a_space_opens_what_can_only_come_next_with_the_cursor_in_it() {
+        let rl = opened();
+        assert_eq!(rl.current_buffer_contents(), "each {  }");
+        assert_eq!(rl.current_insertion_point(), "each { ".len());
+    }
+
+    #[test]
+    fn what_was_opened_stays_once_the_writing_goes_on_in_it() {
+        let mut rl = opened();
+        send_edit(&mut rl, EditCommand::InsertChar('$'));
+        assert_eq!(rl.current_buffer_contents(), "each { $ }");
+        // Then it is the line's, and a Backspace is a Backspace.
+        send_edit(&mut rl, EditCommand::Backspace);
+        assert_eq!(rl.current_buffer_contents(), "each {  }");
+    }
+
+    #[test]
+    fn a_backspace_takes_back_what_was_opened() {
+        let mut rl = opened();
+        send_edit(&mut rl, EditCommand::Backspace);
+        assert_eq!(rl.current_buffer_contents(), "each ");
+        assert_eq!(rl.current_insertion_point(), "each ".len());
+    }
+
+    #[test]
+    fn typing_a_flag_or_what_it_starts_with_goes_where_it_was() {
+        let mut rl = opened();
+        send_edit(&mut rl, EditCommand::InsertChar('-'));
+        assert_eq!(rl.current_buffer_contents(), "each -");
+
+        let mut rl = opened();
+        send_edit(&mut rl, EditCommand::InsertChar('{'));
+        assert_eq!(rl.current_buffer_contents(), "each {");
+    }
+
+    /// The buffer's row as `rl` draws it, escapes included.
+    fn drawn_with_sign(line: &str, mark: Option<std::ops::Range<usize>>) -> String {
+        let sign = crate::Sign {
+            style: nu_ansi_term::Style::new().fg(nu_ansi_term::Color::Red),
+            marks: mark.into_iter().collect(),
+            ..crate::Sign::default()
+        };
+        let mut rl = engine_with_sign(line, 40, sign);
+        repaint_output(&mut rl)
+    }
+
+    #[test]
+    fn a_mark_is_drawn_on_the_text_it_is_about_and_nothing_at_the_end_of_the_row() {
+        let plain = drawn_with_sign("ls = foo", None);
+        let marked = drawn_with_sign("ls = foo", Some(3..4));
+        assert_ne!(plain, marked);
+        let red = nu_ansi_term::Style::new()
+            .fg(nu_ansi_term::Color::Red)
+            .paint("=")
+            .to_string();
+        assert!(marked.contains(&red), "{marked:?}");
+    }
+
+    /// A status line that answers `sign`, with no status text of its own.
+    struct Signs(Option<crate::Sign>);
+
+    impl StatusLine for Signs {
+        fn status(&mut self, _: &str, _: usize, _: u16, _: bool) -> String {
+            String::new()
+        }
+
+        fn sign(&mut self, _: &str, _: usize) -> Option<crate::Sign> {
+            self.0.clone()
+        }
+    }
+
+    fn cross() -> crate::Sign {
+        crate::Sign {
+            text: "✗".into(),
+            style: Style::new().fg(nu_ansi_term::Color::Red),
+            note: Some("not a command".into()),
+            span: Some(0..3),
+            marks: vec![],
+        }
+    }
+
+    /// An engine on a `width` column screen with `line` typed and a sign.
+    fn engine_with_sign(line: &str, width: u16, sign: crate::Sign) -> Reedline {
+        let mut rl = on_screen(
+            Reedline::create().with_status_line(Box::new(Signs(Some(sign)))),
+            width,
+            10,
+        );
+        type_text(&mut rl, line);
+        rl
+    }
+
+    #[test]
+    fn a_sign_is_drawn_at_the_right_end_of_the_cursors_row() {
+        let mut rl = engine_with_sign("foo bar", 30, cross());
+
+        let rows = screen_rows(&mut rl);
+
+        assert!(rows[0].contains("foo bar"), "{rows:?}");
+        assert!(rows[0].ends_with('✗'), "{rows:?}");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(rows[0].as_str()), 30);
+        assert_eq!(rows.get(1).map(String::as_str), Some(""), "no message row");
+    }
+
+    #[test]
+    fn a_sign_sits_left_of_the_right_prompt() {
+        let prompt = DefaultPrompt::new(
+            crate::DefaultPromptSegment::Empty,
+            crate::DefaultPromptSegment::Basic("right".into()),
+        );
+        let mut rl = engine_with_sign("foo", 40, cross());
+        rl.repaint(&prompt).expect("paints");
+
+        let rows = rl.painter.screen_rows_for_test();
+
+        assert!(rows[0].ends_with("✗ right"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_sign_gives_way_to_the_right_prompt_when_both_do_not_fit() {
+        let prompt = DefaultPrompt::new(
+            crate::DefaultPromptSegment::Empty,
+            crate::DefaultPromptSegment::Basic("right".into()),
+        );
+        // `> foo` and `right` leave two free columns, short of the sign and
+        // the space between.
+        let mut rl = engine_with_sign("foo", 12, cross());
+        rl.repaint(&prompt).expect("paints");
+
+        let rows = rl.painter.screen_rows_for_test();
+
+        assert!(rows[0].ends_with("right"), "{rows:?}");
+        assert!(!rows[0].contains('✗'), "{rows:?}");
+    }
+
+    #[test]
+    fn a_sign_is_cut_to_two_columns_and_follows_the_cursor_across_a_wrap() {
+        let wide = crate::Sign {
+            text: "abcd".into(),
+            ..cross()
+        };
+        // The line fills the first row, so the cursor is on the second.
+        let mut rl = engine_with_sign(&"x".repeat(14), 16, wide);
+
+        let rows = screen_rows(&mut rl);
+
+        assert!(rows[1].ends_with("ab"), "{rows:?}");
+        assert!(!rows[0].contains("ab"), "{rows:?}");
+    }
+
+    #[test]
+    fn the_note_shows_on_the_status_row_only_while_the_cursor_is_on_the_word() {
+        let mut rl = engine_with_sign("foo bar", 40, cross());
+
+        send_edit(&mut rl, EditCommand::MoveToStart { select: false });
+        let rows = screen_rows(&mut rl);
+        assert_eq!(rows[1], "  not a command", "{rows:?}");
+
+        send_edit(&mut rl, EditCommand::MoveToEnd { select: false });
+        let rows = screen_rows(&mut rl);
+        assert_eq!(rows[1], "", "{rows:?}");
+        assert!(rows[0].ends_with('✗'), "the sign stays: {rows:?}");
+    }
+
+    #[test]
+    fn a_sign_is_hidden_while_the_line_is_submitted() {
+        let mut rl = engine_with_sign("foo", 30, cross());
+        rl.hide_hints = true;
+
+        assert!(!screen_rows(&mut rl)[0].contains('✗'));
+    }
+
+    /// The word at byte `pos` of `line`.
+    fn word_at(line: &str, pos: usize) -> &str {
+        let start = line[..pos].rfind(' ').map_or(0, |at| at + 1);
+        let end = line[pos..].find(' ').map_or(line.len(), |at| pos + at);
+        &line[start..end]
+    }
+
+    /// What a [`Hovers`] completer was asked about the token under the cursor.
+    type HoverLog = Arc<Mutex<Vec<(String, usize, u16)>>>;
+
+    /// A completer that finishes `foo` as `foobar`, and answers a hover with
+    /// `about` and the word under the cursor, `rows` times over.
+    struct Hovers {
+        asked: HoverLog,
+        rows: usize,
+    }
+
+    impl Completer for Hovers {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            let items = (request.line.ends_with("foo")).then(|| Suggestion {
+                value: "foobar".into(),
+                span: Span::new(request.line.len() - 3, request.line.len()),
+                ..Suggestion::default()
+            });
+            reply.send(items.into_iter().collect::<Vec<_>>().into());
+        }
+
+        fn hover(&mut self, line: &str, pos: usize, width: u16, reply: Reply<Preview>) {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((line.to_owned(), pos, width));
+            let word = word_at(line, pos);
+            reply.send(
+                (0..self.rows)
+                    .map(|row| format!("about {word} {row}"))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+    }
+
+    /// A vi engine over [`Hovers`] with passive completions, on a 40 by 12
+    /// screen, in insert mode with `ls foo` typed.
+    fn vi_hovering(rows: usize) -> (Reedline, HoverLog) {
+        let asked = HoverLog::default();
+        let mut rl = on_screen(
+            seam_engine(Box::<crate::Vi>::default())
+                .with_completer(Box::new(Hovers {
+                    asked: Arc::clone(&asked),
+                    rows,
+                }))
+                .with_passive_completions(true),
+            40,
+            12,
+        );
+        drive(
+            &mut rl,
+            &[ch('l'), ch('s'), ch(' '), ch('f'), ch('o'), ch('o')],
+        );
+        (rl, asked)
+    }
+
+    #[test]
+    fn a_normal_mode_shows_the_preview_of_the_token_under_the_cursor_and_no_suggestions() {
+        let (mut rl, asked) = vi_hovering(1);
+        let rows = screen_rows(&mut rl);
+        assert!(
+            rows[0].ends_with("ls foobar"),
+            "the ghost, in insert mode: {rows:?}"
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "nothing hovers while typing"
+        );
+
+        type_each(&mut rl, &[key(KeyCode::Esc)]);
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("ls foo"), "no ghost: {rows:?}");
+        assert_eq!(framed(&rows[2]), Some("about foo 0"), "{rows:?}");
+        assert_eq!(rl.completion.drawn(), Drawn::Nothing);
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!((asked[0].0.as_str(), asked[0].1), ("ls foo", 5));
+    }
+
+    #[test]
+    fn a_run_of_motions_asks_once_and_the_preview_follows_the_cursor() {
+        let (mut rl, asked) = vi_hovering(1);
+        drive(&mut rl, &[key(KeyCode::Esc)]);
+
+        // Four motions in one batch are one paint, so one question.
+        drive(&mut rl, &[ch('h'), ch('h'), ch('h'), ch('h')]);
+
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        assert_eq!(framed(&screen_rows(&mut rl)[2]), Some("about ls 0"));
+        // Painting again asks nothing: the cursor has not moved.
+        repaint(&mut rl);
+        assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_preview_is_hidden_on_entering_insert_mode() {
+        let (mut rl, _) = vi_hovering(1);
+        drive(&mut rl, &[key(KeyCode::Esc)]);
+        assert_eq!(framed(&screen_rows(&mut rl)[2]), Some("about foo 0"));
+
+        drive(&mut rl, &[ch('i')]);
+
+        let rows = screen_rows(&mut rl);
+        assert_eq!(rows[1], "", "{rows:?}");
+        assert!(!rl.completion.is_hovering());
+    }
+
+    #[test]
+    fn a_preview_for_a_place_the_cursor_left_is_dropped() {
+        /// The replies a [`Parks`] completer holds, with the cursor each was for.
+        type Held = Arc<Mutex<Vec<(usize, Reply<Preview>)>>>;
+
+        let replies = Held::default();
+
+        struct Parks(Held);
+        impl Completer for Parks {
+            fn complete(&mut self, _: Request<'_>, _: Reply<Completions>) {}
+
+            fn hover(&mut self, _: &str, pos: usize, _: u16, reply: Reply<Preview>) {
+                self.0.lock().unwrap().push((pos, reply));
+            }
+        }
+
+        let mut rl = on_screen(
+            seam_engine(Box::<crate::Vi>::default())
+                .with_completer(Box::new(Parks(Arc::clone(&replies)))),
+            40,
+            12,
+        );
+        type_each(&mut rl, &[ch('a'), ch('b'), ch('c'), key(KeyCode::Esc)]);
+        drive(&mut rl, &[ch('h')]);
+        let mut asked = std::mem::take(&mut *replies.lock().unwrap());
+        assert_eq!(asked.len(), 2);
+        let (second, new) = asked.pop().expect("asked twice");
+        let (first, old) = asked.pop().expect("asked twice");
+        assert_eq!((first, second), (2, 1));
+
+        old.send(vec!["the old one".to_owned()].into());
+        assert!(!rl.land_completions(), "the cursor left it");
+        new.send(vec!["the new one".to_owned()].into());
+        assert!(rl.land_completions());
+        assert_eq!(framed(&screen_rows(&mut rl)[2]), Some("the new one"));
+    }
+
+    #[test]
+    fn a_hover_is_scrolled_by_alt_arrows_and_the_wheel_and_hidden_by_esc() {
+        let (mut rl, _) = vi_hovering(30);
+        drive(&mut rl, &[key(KeyCode::Esc)]);
+        repaint(&mut rl);
+        assert_eq!(rl.completion.preview_offset(), 0);
+
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        let offset = rl.completion.preview_offset();
+        assert!(offset > 0);
+        repaint(&mut rl);
+        // The row of a preview's line, wherever the prompt (it shows the working directory)
+        // leaves the preview.
+        let row_of = |rl: &mut Reedline, line: usize| {
+            let rows = screen_rows(rl);
+            let row = rows
+                .iter()
+                .position(|row| framed(row) == Some(&format!("about foo {line}")))
+                .unwrap_or_else(|| panic!("about foo {line} in {rows:?}"));
+            u16::try_from(row).expect("a screen row")
+        };
+
+        let row = row_of(&mut rl, offset);
+        mouse(&mut rl, row, MouseButton::ScrollDown);
+        // A turn is a quarter of the preview's height, which is 8 rows here.
+        assert_eq!(rl.completion.preview_offset(), offset + 2);
+        let row = row_of(&mut rl, offset + 2);
+        mouse(&mut rl, row, MouseButton::ScrollUp);
+        assert_eq!(rl.completion.preview_offset(), offset);
+
+        send(&mut rl, ReedlineEvent::Esc);
+        assert_eq!(screen_rows(&mut rl)[1], "", "hidden until the cursor moves");
+        drive(&mut rl, &[ch('h')]);
+        assert_eq!(framed(&screen_rows(&mut rl)[2]), Some("about foo 0"));
+    }
+
+    #[test]
+    fn helix_normal_and_select_modes_hover_too() {
+        let asked = HoverLog::default();
+        let mut rl = on_screen(
+            seam_engine(Box::<crate::Helix>::default()).with_completer(Box::new(Hovers {
+                asked: Arc::clone(&asked),
+                rows: 1,
+            })),
+            40,
+            12,
+        );
+        type_each(&mut rl, &[ch('a'), ch('b'), key(KeyCode::Esc)]);
+        assert_eq!(
+            rl.prompt_edit_mode(),
+            PromptEditMode::Helix(PromptHelixMode::Normal)
+        );
+        assert_eq!(framed(&screen_rows(&mut rl)[2]), Some("about ab 0"));
+
+        type_each(&mut rl, &[ch('v')]);
+        assert_eq!(
+            rl.prompt_edit_mode(),
+            PromptEditMode::Helix(PromptHelixMode::Select)
+        );
+        assert_eq!(framed(&screen_rows(&mut rl)[2]), Some("about ab 0"));
+    }
+
+    #[test]
+    fn a_menu_opened_by_a_key_still_shows_in_a_normal_mode() {
+        let mut rl = on_screen(
+            seam_engine(Box::<crate::Vi>::default())
+                .with_completer(Box::new(Hovers {
+                    asked: HoverLog::default(),
+                    rows: 1,
+                }))
+                .with_menu(ReedlineMenu::new("completion_menu"))
+                .with_quick_completions(false)
+                .with_partial_completions(false),
+            40,
+            12,
+        );
+        type_each(&mut rl, &[ch('f'), ch('o'), ch('o'), key(KeyCode::Esc)]);
+        assert!(!completions_open(&rl), "typing in insert mode left none");
+
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
+
+        assert!(completions_open(&rl));
+        let rows = screen_rows(&mut rl);
+        assert_eq!(framed(&rows[2]), Some("foobar"), "{rows:?}");
+        assert!(!rl.completion.is_hovering(), "the list has the panel");
+    }
+
+    #[test]
+    fn a_resize_asks_for_the_hover_preview_again_at_the_new_width() {
+        let (mut rl, asked) = vi_hovering(1);
+        type_each(&mut rl, &[key(KeyCode::Esc)]);
+        assert_eq!(asked.lock().unwrap().last().map(|ask| ask.2), Some(40));
+
+        send(&mut rl, ReedlineEvent::Resize(30, 12));
+        repaint(&mut rl);
+
+        assert_eq!(asked.lock().unwrap().last().map(|ask| ask.2), Some(30));
+    }
+
+    /// The screen column and row of the first `needle` on `rows`.
+    fn place_of(rows: &[String], needle: &str) -> Option<(u16, u16)> {
+        rows.iter().enumerate().find_map(|(row, text)| {
+            let at = text.find(needle)?;
+            let column = unicode_width::UnicodeWidthStr::width(&text[..at]);
+            Some((u16::try_from(column).ok()?, u16::try_from(row).ok()?))
+        })
+    }
+
+    /// A mouse event at `(column, row)` of the screen; the next [`screen_rows`] repaints.
+    fn mouse_at(rl: &mut Reedline, (column, row): (u16, u16), button: MouseButton) {
+        send(
+            rl,
+            ReedlineEvent::Mouse {
+                column,
+                row,
+                button,
+            },
+        );
+    }
+
+    /// A completer of `items` suggestions `w0`, `w1`, ..., each previewed as `rows` rows
+    /// `pv <item>.<row>;` and `more` more folded away.
+    struct Scrolls {
+        items: usize,
+        rows: usize,
+        more: usize,
+    }
+
+    impl Completer for Scrolls {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            let items: Vec<Suggestion> = (0..self.items)
+                .map(|n| Suggestion {
+                    value: format!("w{n}"),
+                    span: Span::new(0, request.line.len()),
+                    ..Suggestion::default()
+                })
+                .collect();
+            reply.send(items.into());
+        }
+
+        fn preview(&mut self, _: &Completions, index: usize, _: u16, reply: Reply<Preview>) {
+            let row = |n: usize| format!("pv {index}.{n};");
+            reply.send(Preview {
+                rows: (0..self.rows).map(row).collect(),
+                more: (self.rows..self.rows + self.more).map(row).collect(),
+                summary: format!("{} more", self.more),
+                ..Preview::default()
+            });
+        }
+    }
+
+    /// An engine over [`Scrolls`] on a `width` by `height` screen, with "w" typed and the menu
+    /// open on the first suggestion, painted.
+    fn scrolling_engine(width: u16, height: u16, scrolls: Scrolls) -> Reedline {
+        let mut rl = on_screen(
+            Reedline::create()
+                .with_completer(Box::new(scrolls))
+                .with_menu(ReedlineMenu::new("completion_menu"))
+                .with_quick_completions(false)
+                .with_partial_completions(false),
+            width,
+            height,
+        );
+        type_text(&mut rl, "w");
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
+        screen_rows(&mut rl);
+        rl
+    }
+
+    /// The rows of the preview the panel drew in the last paint.
+    fn drawn_window(rl: &Reedline) -> std::ops::Range<usize> {
+        rl.panel.preview_window().expect("a preview was drawn")
+    }
+
+    #[test]
+    fn the_wheel_and_alt_arrows_scroll_the_preview_and_stop_at_its_ends() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 5,
+                rows: 30,
+                more: 0,
+            },
+        );
+        let window = drawn_window(&rl);
+        assert_eq!(window.start, 0);
+        assert!(window.len() > 4 && window.len() < 30, "{window:?}");
+
+        // The wheel over the preview scrolls the preview alone.
+        let rows = screen_rows(&mut rl);
+        let at = place_of(&rows, "pv 0.0;").expect("the preview is beside the list");
+        mouse_at(&mut rl, at, MouseButton::ScrollDown);
+        screen_rows(&mut rl);
+        assert_eq!(rl.completion.preview_offset(), 3);
+        assert_eq!(drawn_window(&rl).start, 3);
+        assert_eq!(highlighted(&rl), Some("w0"), "the selection stays");
+
+        // To the end, which fills the room: no blank rows, no further.
+        for _ in 0..40 {
+            send(&mut rl, ReedlineEvent::PreviewDown);
+        }
+        let rows = screen_rows(&mut rl);
+        let window = drawn_window(&rl);
+        assert_eq!(window.end, 30);
+        assert_eq!(rl.completion.preview_offset(), window.start);
+        let (_, first) = place_of(&rows, &format!("pv 0.{};", window.start)).expect("on screen");
+        for (n, row) in rows[usize::from(first)..]
+            .iter()
+            .take(window.len())
+            .enumerate()
+        {
+            assert!(
+                row.contains(&format!(" pv 0.{}; ", window.start + n)),
+                "{rows:?}"
+            );
+        }
+
+        // A press up moves at once: there is no overshoot to scroll back through.
+        let end = window.start;
+        send(&mut rl, ReedlineEvent::PreviewUp);
+        screen_rows(&mut rl);
+        assert!(drawn_window(&rl).start < end);
+
+        // The wheel up stops at the top.
+        let rows = screen_rows(&mut rl);
+        let at = place_of(&rows, &format!("pv 0.{};", drawn_window(&rl).start)).expect("on screen");
+        for _ in 0..20 {
+            mouse_at(&mut rl, at, MouseButton::ScrollUp);
+            screen_rows(&mut rl);
+        }
+        assert_eq!(rl.completion.preview_offset(), 0);
+        assert_eq!(drawn_window(&rl).start, 0);
+    }
+
+    #[test]
+    fn the_wheel_over_the_list_moves_the_selection_by_one_without_jumping() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 20,
+                rows: 4,
+                more: 0,
+            },
+        );
+        send(&mut rl, ReedlineEvent::Esc);
+        assert_eq!(highlighted(&rl), None);
+        let rows = screen_rows(&mut rl);
+        let at = place_of(&rows, "w1").expect("the list");
+
+        mouse_at(&mut rl, at, MouseButton::ScrollUp);
+        assert_eq!(
+            highlighted(&rl),
+            None,
+            "up from nothing does not jump to the end"
+        );
+        mouse_at(&mut rl, at, MouseButton::ScrollDown);
+        assert_eq!(highlighted(&rl), Some("w0"));
+        mouse_at(&mut rl, at, MouseButton::ScrollDown);
+        assert_eq!(highlighted(&rl), Some("w1"));
+        mouse_at(&mut rl, at, MouseButton::ScrollUp);
+        assert_eq!(highlighted(&rl), Some("w0"));
+    }
+
+    #[test]
+    fn the_list_window_follows_the_selection_and_its_label_counts_what_is_left() {
+        let mut rl = scrolling_engine(
+            60,
+            20,
+            Scrolls {
+                items: 20,
+                rows: 2,
+                more: 0,
+            },
+        );
+        for _ in 0..12 {
+            send(&mut rl, ReedlineEvent::MenuNext);
+        }
+        assert_eq!(highlighted(&rl), Some("w12"));
+        let rows = screen_rows(&mut rl);
+        let listed = |rows: &[String], value| rows.iter().any(|row| framed(row) == Some(value));
+        // Six rows in the frame, w9 to w14: the selection keeps two rows after it, and the
+        // frame counts the fourteen left out.
+        assert!(listed(&rows, "w9") && listed(&rows, "w14"), "{rows:?}");
+        assert!(!listed(&rows, "w8") && !listed(&rows, "w15"), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("─ +14 ─")), "{rows:?}");
+
+        // Up inside the window leaves it where it is.
+        send(&mut rl, ReedlineEvent::MenuPrevious);
+        let rows = screen_rows(&mut rl);
+        assert!(listed(&rows, "w9"), "{rows:?}");
+
+        // A page stops at the end of the list.
+        for _ in 0..4 {
+            send(&mut rl, ReedlineEvent::MenuPageNext);
+        }
+        assert_eq!(highlighted(&rl), Some("w19"));
+        let rows = screen_rows(&mut rl);
+        assert!(listed(&rows, "w19") && !listed(&rows, "w13"), "{rows:?}");
+    }
+
+    /// The list's window as the panel drew it, and as the session keeps it.
+    fn list_drawn(rl: &Reedline) -> std::ops::Range<usize> {
+        let window = rl.panel.list_window().expect("a list was drawn");
+        assert_eq!(
+            rl.completion.list_offset(),
+            window.start,
+            "one source of truth"
+        );
+        window
+    }
+
+    #[test]
+    fn the_list_scrolls_ahead_of_the_selection_and_the_session_keeps_where_it_is() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 30,
+                rows: 2,
+                more: 0,
+            },
+        );
+        let height = list_drawn(&rl).len();
+        assert!(height > 5, "{height}");
+
+        // Down through the list: the window starts moving two rows before the end of it.
+        for _ in 0..height - 3 {
+            send(&mut rl, ReedlineEvent::MenuNext);
+            screen_rows(&mut rl);
+        }
+        assert_eq!(list_drawn(&rl).start, 0, "{:?}", list_drawn(&rl));
+        send(&mut rl, ReedlineEvent::MenuNext);
+        screen_rows(&mut rl);
+        assert_eq!(list_drawn(&rl).start, 1);
+        assert_eq!(highlighted(&rl), Some(format!("w{}", height - 2).as_str()));
+
+        // Back up within the window: it stays, until the selection is two rows from its top.
+        for _ in 0..height - 5 {
+            send(&mut rl, ReedlineEvent::MenuPrevious);
+            screen_rows(&mut rl);
+        }
+        assert_eq!(list_drawn(&rl).start, 1);
+        send(&mut rl, ReedlineEvent::MenuPrevious);
+        screen_rows(&mut rl);
+        assert_eq!(list_drawn(&rl).start, 0);
+
+        // The wheel is the same selection, so the same window.
+        let rows = screen_rows(&mut rl);
+        let at = place_of(&rows, "w1").expect("the list");
+        for _ in 0..40 {
+            mouse_at(&mut rl, at, MouseButton::ScrollDown);
+            screen_rows(&mut rl);
+        }
+        assert_eq!(highlighted(&rl), Some("w29"));
+        assert_eq!(list_drawn(&rl).end, 30, "the end of the list");
+
+        // A new answer starts at the top again.
+        type_text(&mut rl, "x");
+        screen_rows(&mut rl);
+        assert_eq!(rl.completion.list_offset(), 0);
+    }
+
+    #[test]
+    fn a_click_selects_what_is_drawn_under_the_pointer_without_moving_it() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 30,
+                rows: 2,
+                more: 0,
+            },
+        );
+        for _ in 0..10 {
+            send(&mut rl, ReedlineEvent::MenuNext);
+            screen_rows(&mut rl);
+        }
+        let window = list_drawn(&rl);
+        assert!(window.start > 0, "{window:?}");
+
+        // The last row of the list is within the margin of its edge, which a key would scroll
+        // ahead of, and the panel's frame starts under the line on screen row 1.
+        let last_row = u16::try_from(window.len() + 1).expect("fits");
+        let clicked = window.end - 1;
+        mouse_at(&mut rl, (4, last_row), MouseButton::Left);
+        screen_rows(&mut rl);
+        assert_eq!(highlighted(&rl), Some(format!("w{clicked}").as_str()));
+        assert_eq!(list_drawn(&rl), window, "the row stayed under the pointer");
+
+        // So the same click again is on the same row, and takes it.
+        mouse_at(&mut rl, (4, last_row), MouseButton::Left);
+        assert!(
+            rl.current_buffer_contents()
+                .starts_with(&format!("w{clicked}")),
+            "{:?}",
+            rl.current_buffer_contents()
+        );
+
+        // A key moves the selection from there, with the margin again.
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 30,
+                rows: 2,
+                more: 0,
+            },
+        );
+        mouse_at(&mut rl, (4, last_row), MouseButton::Left);
+        send(&mut rl, ReedlineEvent::MenuNext);
+        screen_rows(&mut rl);
+        assert!(list_drawn(&rl).start > 0, "{:?}", list_drawn(&rl));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_preview_over_its_blank_cells_and_the_list_over_the_gap() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 5,
+                rows: 30,
+                more: 0,
+            },
+        );
+        let rows = screen_rows(&mut rl);
+        let (preview, row) = place_of(&rows, "pv 0.0;").expect("beside the list");
+
+        // The cell past the end of a preview row, and the one below the list, are the preview's.
+        mouse_at(&mut rl, (59, row + 1), MouseButton::ScrollDown);
+        assert_eq!(rl.completion.preview_offset(), 3);
+        assert_eq!(highlighted(&rl), Some("w0"));
+        screen_rows(&mut rl);
+        mouse_at(&mut rl, (preview + 1, row + 7), MouseButton::ScrollUp);
+        assert_eq!(rl.completion.preview_offset(), 0);
+
+        // The edge between them is the list's.
+        mouse_at(&mut rl, (preview - 2, row), MouseButton::ScrollDown);
+        assert_eq!(highlighted(&rl), Some("w1"));
+        assert_eq!(rl.completion.preview_offset(), 0);
+    }
+
+    /// Draws like [`Rows`], and answers hits like a framed panel: the rows past the list are all
+    /// frame, but it says which part of the panel they are.
+    #[derive(Default)]
+    struct Framed(Rows);
+
+    impl Panel for Framed {
+        fn render(&mut self, view: &View<'_>) -> Vec<String> {
+            self.0.render(view)
+        }
+
+        fn hit_at(&self, row: u16, column: u16) -> Option<Hit> {
+            let hit = self.0.hit_at(row, column)?;
+            Some(match hit {
+                Hit::Item(_) => hit,
+                _ => Hit::Frame,
+            })
+        }
+
+        fn region_at(&self, row: u16, _: u16) -> Option<Region> {
+            Some(if usize::from(row) < self.0.items {
+                Region::List
+            } else {
+                Region::Preview
+            })
+        }
+    }
+
+    #[test]
+    fn the_wheel_goes_by_the_region_a_panel_names_not_by_what_a_click_would_hit() {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(Tall))
+            .with_panel(Box::<Framed>::default())
+            .with_quick_completions(false)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::new("completion_menu"));
+        reedline.painter = Painter::new(W::capture());
+        reedline.painter.force_prompt_anchored_for_test(0);
+        type_text(&mut reedline, "ab");
+        send(&mut reedline, ReedlineEvent::Menu("completion_menu".into()));
+        repaint(&mut reedline);
+
+        // A frame cell below the list: a click does nothing there, the wheel scrolls the preview.
+        mouse(&mut reedline, 3, MouseButton::ScrollDown);
+        assert_eq!(reedline.completion.preview_offset(), 3);
+        assert_eq!(highlighted(&reedline), Some("ab!"));
+        mouse(&mut reedline, 1, MouseButton::ScrollDown);
+        assert_eq!(highlighted(&reedline), Some("ab?"));
+        mouse(&mut reedline, 3, MouseButton::Left);
+        assert_eq!(
+            highlighted(&reedline),
+            Some("ab?"),
+            "a frame is not a click"
+        );
+    }
+
+    /// A mouse event as the terminal reports it.
+    fn terminal_mouse(kind: crossterm::event::MouseEventKind, (column, row): (u16, u16)) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn a_resize_in_a_batch_is_handled_where_it_came_and_the_mouse_after_it_is_not_trusted() {
+        use crossterm::event::{MouseButton as Button, MouseEventKind::Down};
+        let (mut reedline, _) = engine_with_clickable_panel();
+        assert_eq!(highlighted(&reedline), Some("ab!"));
+        let click = |row| terminal_mouse(Down(Button::Left), (0, row));
+
+        // A click before the resize is on the layout it was made on, one after it is on none.
+        let batch = vec![
+            click(2),
+            Event::Resize(100, 30),
+            click(1),
+            Event::Resize(90, 20),
+        ];
+        let flow = reedline
+            .process_input_batch(&DefaultPrompt::default(), batch)
+            .expect("batch ok");
+        assert!(matches!(flow, ControlFlow::Continue(())));
+        assert_eq!(highlighted(&reedline), Some("ab?"), "only the first click");
+        let size = (
+            reedline.painter.screen_width(),
+            reedline.painter.screen_height(),
+        );
+        assert_eq!(size, (90, 20), "the last size wins");
+    }
+
+    #[test]
+    fn edits_around_a_resize_keep_their_order_and_a_press_checks_where_the_panel_is() {
+        use crossterm::event::{MouseButton as Button, MouseEventKind::Down};
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 5,
+                rows: 2,
+                more: 0,
+            },
+        );
+        let batch = vec![
+            Event::Key(ch('x')),
+            Event::Resize(60, 16),
+            Event::Key(ch('y')),
+        ];
+        let flow = rl
+            .process_input_batch(&short_prompt(), batch)
+            .expect("batch ok");
+        assert!(matches!(flow, ControlFlow::Continue(())));
+        assert_eq!(rl.current_buffer_contents(), "wxy");
+
+        // The painter believes the frame starts lower than it does: a press asks the terminal
+        // and is right about the row, which a wheel turn would not have corrected.
+        screen_rows(&mut rl);
+        rl.painter.force_prompt_anchored_for_test(3);
+        // Under the line, the frame's top edge, then the rows of the list.
+        let click = terminal_mouse(Down(Button::Left), (4, 3));
+        let flow = rl
+            .process_input_batch(&short_prompt(), vec![click])
+            .expect("batch ok");
+        assert!(matches!(flow, ControlFlow::Continue(())));
+        assert_eq!(highlighted(&rl), Some("w1"), "the second row of the list");
+    }
+
+    #[test]
+    fn a_short_narrow_screen_keeps_the_selection_and_the_preview_end_in_view() {
+        let mut rl = scrolling_engine(
+            30,
+            8,
+            Scrolls {
+                items: 20,
+                rows: 30,
+                more: 0,
+            },
+        );
+        for n in 1..20 {
+            send(&mut rl, ReedlineEvent::MenuNext);
+            let rows = screen_rows(&mut rl);
+            let mark = format!("> w{n}");
+            assert!(
+                rows.iter()
+                    .any(|row| row == &mark || row.starts_with(&format!("{mark} "))),
+                "w{n} is not on screen: {rows:?}"
+            );
+            assert_eq!(rows.len(), 8);
+            assert!(rows
+                .iter()
+                .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= 30));
+        }
+        for _ in 0..40 {
+            send(&mut rl, ReedlineEvent::PreviewDown);
+        }
+        screen_rows(&mut rl);
+        let window = drawn_window(&rl);
+        assert_eq!(window.end, 30, "the last row is reachable");
+        assert_eq!(rl.completion.preview_offset(), window.start);
+    }
+
+    #[test]
+    fn a_resize_keeps_the_scroll_offset_to_what_the_panel_draws() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 3,
+                rows: 30,
+                more: 0,
+            },
+        );
+        for _ in 0..40 {
+            send(&mut rl, ReedlineEvent::PreviewDown);
+        }
+        screen_rows(&mut rl);
+        let tall = drawn_window(&rl);
+        assert_eq!(tall.end, 30);
+
+        // A shorter panel draws fewer rows from the same one, never past the end.
+        send(&mut rl, ReedlineEvent::Resize(60, 9));
+        repaint(&mut rl);
+        let short = drawn_window(&rl);
+        assert!(short.len() < tall.len(), "{short:?} in a shorter panel");
+        assert_eq!(short.start, tall.start);
+        assert_eq!(rl.completion.preview_offset(), short.start);
+        for _ in 0..40 {
+            send(&mut rl, ReedlineEvent::PreviewDown);
+        }
+        repaint(&mut rl);
+        assert_eq!(drawn_window(&rl).end, 30, "the end is still reachable");
+
+        // A taller one fills with rows rather than leave blank ones.
+        send(&mut rl, ReedlineEvent::Resize(60, 16));
+        repaint(&mut rl);
+        let window = drawn_window(&rl);
+        assert_eq!(window.end, 30);
+        assert_eq!(window.len(), tall.len());
+        assert_eq!(rl.completion.preview_offset(), window.start);
+    }
+
+    #[test]
+    fn a_preview_starts_at_its_top_when_the_selection_or_the_hovered_token_changes() {
+        let mut rl = scrolling_engine(
+            60,
+            16,
+            Scrolls {
+                items: 3,
+                rows: 30,
+                more: 0,
+            },
+        );
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        assert!(rl.completion.preview_offset() > 0);
+        send(&mut rl, ReedlineEvent::MenuNext);
+        screen_rows(&mut rl);
+        assert_eq!(rl.completion.preview_offset(), 0);
+        assert_eq!(drawn_window(&rl).start, 0);
+
+        let (mut rl, _) = vi_hovering(30);
+        drive(&mut rl, &[key(KeyCode::Esc)]);
+        repaint(&mut rl);
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        assert!(rl.completion.preview_offset() > 0);
+        drive(&mut rl, &[ch('h'), ch('h'), ch('h'), ch('h')]);
+        screen_rows(&mut rl);
+        assert_eq!(
+            rl.completion.preview_offset(),
+            0,
+            "another token, another preview"
+        );
+    }
+
+    #[test]
+    fn unfolding_a_preview_and_folding_it_again_keep_the_scroll_to_what_is_drawn() {
+        let mut rl = scrolling_engine(
+            60,
+            20,
+            Scrolls {
+                items: 3,
+                rows: 6,
+                more: 20,
+            },
+        );
+        let rows = screen_rows(&mut rl);
+        let label = place_of(&rows, "▸ 20 more").expect("the fold's label");
+        assert_eq!(drawn_window(&rl), 0..6);
+
+        mouse_at(&mut rl, label, MouseButton::Left);
+        for _ in 0..40 {
+            send(&mut rl, ReedlineEvent::PreviewDown);
+        }
+        let rows = screen_rows(&mut rl);
+        assert!(rl.completion.unfolded());
+        assert_eq!(drawn_window(&rl).end, 26);
+        assert!(place_of(&rows, "pv 0.25;").is_some(), "{rows:?}");
+        let label = place_of(&rows, "▾").expect("the label of an unfolded preview");
+
+        mouse_at(&mut rl, label, MouseButton::Left);
+        let rows = screen_rows(&mut rl);
+        assert!(!rl.completion.unfolded());
+        assert_eq!(drawn_window(&rl), 0..6);
+        assert_eq!(rl.completion.preview_offset(), 0);
+        assert!(place_of(&rows, "▸ 20 more").is_some(), "{rows:?}");
+    }
+
+    /// A completer of the suggestions `ls` and `lsd` whose first preview has two examples that
+    /// can be taken, the second folded away.
+    struct Examples;
+
+    impl Completer for Examples {
+        fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+            let item = |value: &str| Suggestion {
+                value: value.into(),
+                span: Span::new(0, request.line.len()),
+                ..Suggestion::default()
+            };
+            reply.send(vec![item("ls"), item("lsd")].into());
+        }
+
+        fn preview(&mut self, _: &Completions, index: usize, _: u16, reply: Reply<Preview>) {
+            let pick = |rows, value: &str| crate::Pick {
+                rows,
+                suggestion: Suggestion {
+                    value: value.into(),
+                    span: Span::new(0, 1),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                },
+            };
+            let texts = |texts: &[&str]| texts.iter().map(|text| (*text).to_owned()).collect();
+            reply.send(Preview {
+                rows: texts(&["usage here", "example one", "about it"]),
+                more: texts(&["example two", "and so on"]),
+                summary: "1 more example".into(),
+                picks: if index == 0 {
+                    vec![pick(1..2, "ls -a"), pick(3..4, "ls -l")]
+                } else {
+                    vec![]
+                },
+            });
+        }
+    }
+
+    /// An engine over [`Examples`] with "l" typed and the menu open, painted.
+    fn examples_engine() -> Reedline {
+        let mut rl = on_screen(
+            Reedline::create()
+                .with_completer(Box::new(Examples))
+                .with_menu(ReedlineMenu::new("completion_menu"))
+                .with_quick_completions(false)
+                .with_partial_completions(false),
+            60,
+            16,
+        );
+        type_text(&mut rl, "l");
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
+        screen_rows(&mut rl);
+        rl
+    }
+
+    #[test]
+    fn alt_down_reaches_an_example_which_is_drawn_selected_and_enter_takes() {
+        let mut rl = examples_engine();
+        assert!(!rl.completion.is_picking());
+
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        let rows = screen_rows(&mut rl);
+        let (column, row) = place_of(&rows, "example one").expect("the example");
+        let style =
+            |rl: &mut Reedline, column, row| rl.painter.screen_cell_style_for_test(row, column);
+        assert_eq!(
+            style(&mut rl, column, row).map(|s| s.2),
+            Some(true),
+            "reversed"
+        );
+        let (column, row) = place_of(&rows, "usage here").expect("the usage");
+        assert_eq!(style(&mut rl, column, row).map(|s| s.2), Some(false));
+        // What taking it writes is the virtual text after the cursor, over the list's.
+        assert!(rows[0].ends_with("ls -a"), "{rows:?}");
+        assert_eq!(rl.current_buffer_contents(), "l");
+
+        send(&mut rl, ReedlineEvent::Enter);
+        assert_eq!(
+            rl.current_buffer_contents(),
+            "ls -a ",
+            "span replaced, a space after"
+        );
+        assert_eq!(rl.current_insertion_point(), 6);
+        assert!(!rl.completion.is_picking());
+    }
+
+    #[test]
+    fn an_enter_that_names_a_menu_there_is_not_takes_the_example_and_does_not_submit() {
+        let mut rl = examples_engine();
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        let status = send(
+            &mut rl,
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::Menu("abbr_menu".into()),
+                ReedlineEvent::Enter,
+            ]),
+        );
+        assert!(matches!(status, EventStatus::Handled), "{status:?}");
+        assert_eq!(rl.current_buffer_contents(), "ls -a ");
+    }
+
+    #[test]
+    fn the_next_example_may_be_folded_away_and_a_tab_takes_it() {
+        let mut rl = examples_engine();
+        assert!(!rl.completion.unfolded());
+
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        let rows = screen_rows(&mut rl);
+        assert!(rl.completion.unfolded(), "reaching it unfolds the preview");
+        let (column, row) = place_of(&rows, "example two").expect("unfolded");
+        assert_eq!(
+            rl.painter
+                .screen_cell_style_for_test(row, column)
+                .map(|s| s.2),
+            Some(true)
+        );
+
+        send(&mut rl, ReedlineEvent::Menu("completion_menu".into()));
+        assert_eq!(rl.current_buffer_contents(), "ls -l ");
+
+        // Past the last example the rows scroll; Alt+Up goes back.
+        let mut rl = examples_engine();
+        for _ in 0..3 {
+            send(&mut rl, ReedlineEvent::PreviewDown);
+        }
+        assert_eq!(
+            rl.completion.picked().map(|pick| pick.rows.clone()),
+            Some(3..4)
+        );
+        send(&mut rl, ReedlineEvent::PreviewUp);
+        assert_eq!(
+            rl.completion.picked().map(|pick| pick.rows.clone()),
+            Some(1..2)
+        );
+    }
+
+    #[test]
+    fn a_click_on_an_example_takes_it() {
+        let mut rl = examples_engine();
+        let rows = screen_rows(&mut rl);
+        let at = place_of(&rows, "example one").expect("the example");
+
+        mouse_at(&mut rl, at, MouseButton::Left);
+
+        assert_eq!(rl.current_buffer_contents(), "ls -a ");
+    }
+
+    #[test]
+    fn typing_esc_and_moving_the_selection_drop_the_example() {
+        let mut rl = examples_engine();
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        assert!(rl.completion.is_picking());
+        send(&mut rl, ReedlineEvent::Esc);
+        assert!(!rl.completion.is_picking());
+        assert_eq!(highlighted(&rl), Some("ls"), "Esc drops the pick first");
+        let rows = screen_rows(&mut rl);
+        assert!(
+            !rows[0].contains("ls -a"),
+            "no virtual text of the pick: {rows:?}"
+        );
+
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        send(&mut rl, ReedlineEvent::MenuNext);
+        assert!(!rl.completion.is_picking(), "the selection moved");
+
+        send(&mut rl, ReedlineEvent::MenuPrevious);
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        insert(&mut rl, 's');
+        assert!(!rl.completion.is_picking(), "typed");
+    }
+
+    /// A completer that answers a hover with a preview whose second row is an example that
+    /// replaces the token under the cursor.
+    struct HoverPicks;
+
+    impl Completer for HoverPicks {
+        fn complete(&mut self, _: Request<'_>, reply: Reply<Completions>) {
+            reply.send(Completions::default());
+        }
+
+        fn hover(&mut self, line: &str, pos: usize, _: u16, reply: Reply<Preview>) {
+            let word = word_at(line, pos);
+            let start = line.len() - word.len();
+            reply.send(Preview {
+                rows: vec!["about it".into(), "an example".into()],
+                picks: vec![crate::Pick {
+                    rows: 1..2,
+                    suggestion: Suggestion {
+                        value: format!("{word}bar"),
+                        span: Span::new(start, line.len()),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    },
+                }],
+                ..Preview::default()
+            });
+        }
+    }
+
+    #[test]
+    fn an_example_of_a_hover_preview_is_taken_in_a_normal_mode_too() {
+        let mut rl = on_screen(
+            seam_engine(Box::<crate::Vi>::default()).with_completer(Box::new(HoverPicks)),
+            40,
+            12,
+        );
+        type_each(
+            &mut rl,
+            &[
+                ch('l'),
+                ch('s'),
+                ch(' '),
+                ch('f'),
+                ch('o'),
+                ch('o'),
+                key(KeyCode::Esc),
+            ],
+        );
+        let rows = screen_rows(&mut rl);
+        assert!(place_of(&rows, "an example").is_some(), "{rows:?}");
+
+        send(&mut rl, ReedlineEvent::PreviewDown);
+        let rows = screen_rows(&mut rl);
+        let (column, row) = place_of(&rows, "an example").expect("hovering");
+        assert_eq!(
+            rl.painter
+                .screen_cell_style_for_test(row, column)
+                .map(|s| s.2),
+            Some(true)
+        );
+
+        send(&mut rl, ReedlineEvent::Enter);
+        assert_eq!(rl.current_buffer_contents(), "ls foobar ");
+    }
+
+    #[test]
+    fn a_change_made_between_two_reads_is_followed_like_typing() {
+        /// A completer that records what it is asked and offers the line with a mark.
+        struct Logs(Arc<Mutex<Vec<(String, usize)>>>);
+
+        impl Completer for Logs {
+            fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((request.line.to_owned(), request.cursor));
+                let item = |mark: &str| Suggestion {
+                    value: format!("{}{mark}", request.line),
+                    span: Span::new(0, request.line.len()),
+                    ..Suggestion::default()
+                };
+                reply.send(vec![item("!"), item("?")].into());
+            }
+        }
+
+        let asked = Arc::default();
+        let mut rl = on_screen(
+            Reedline::create()
+                .with_completer(Box::new(Logs(Arc::clone(&asked))))
+                .with_passive_completions(true),
+            40,
+            10,
+        );
+        type_text(&mut rl, "ab");
+        let status = send(&mut rl, ReedlineEvent::ExecuteHostCommand("pick".into()));
+        assert!(matches!(status, EventStatus::Exits(Signal::HostCommand(_))));
+        asked.lock().unwrap().clear();
+
+        // What the host does with the command's output before reading again.
+        rl.run_edit_commands(&[
+            EditCommand::Clear,
+            EditCommand::InsertString("some/file".into()),
+            EditCommand::MoveToPosition {
+                position: 4,
+                select: false,
+            },
+        ]);
+        assert_eq!(*asked.lock().unwrap(), [("some/file".to_owned(), 4)]);
+
+        let _suspended = rl.begin_read();
+        let rows = screen_rows(&mut rl);
+        assert!(
+            rows.iter().any(|row| framed(row) == Some("some/file!")),
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(|row| !row.contains("ab!")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_lone_correction_is_drawn_after_the_cursor_and_no_list() {
+        let fix = |written: &str, value: &str| Suggestion {
+            value: value.into(),
+            span: Span::new(0, written.len()),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("x", vec![fix("crgo", "cargo")]);
+        rl.run_edit_commands(&[EditCommand::Clear, EditCommand::InsertString("crgo".into())]);
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("crgo → cargo"), "{rows:?}");
+        assert!(
+            rows[1..].iter().all(|row| row.is_empty()),
+            "no list: {rows:?}"
+        );
+        assert_eq!(rl.completion.drawn(), Drawn::Ghost);
+
+        // With the cursor past the word, it names it, even where the value starts with it.
+        let longer = Suggestion {
+            value: "==".into(),
+            span: Span::new(0, 1),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("x", vec![longer]);
+        rl.run_edit_commands(&[EditCommand::Clear, EditCommand::InsertString("= 1 ".into())]);
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("= 1   = → =="), "{rows:?}");
+
+        // With the cursor past the word, it names it.
+        let mut rl = engine_offering("x", vec![fix("crgo", "cargo")]);
+        rl.run_edit_commands(&[
+            EditCommand::Clear,
+            EditCommand::InsertString("crgo build".into()),
+        ]);
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("crgo build  crgo → cargo"), "{rows:?}");
+    }
+
+    #[test]
+    fn the_status_steps_aside_while_a_suggestion_is_walked_through() {
+        struct Said;
+        impl StatusLine for Said {
+            fn status(&mut self, _: &str, _: usize, _: u16, _: bool) -> String {
+                "  STATUS".into()
+            }
+        }
+        let word = |value: &str| Suggestion {
+            value: value.into(),
+            span: Span::new(0, 1),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("x", vec![word("aa"), word("ab")]);
+        rl = rl.with_status_line(Box::new(Said));
+        rl.run_edit_commands(&[EditCommand::Clear, EditCommand::InsertString("a".into())]);
+        let rows = screen_rows(&mut rl);
+        assert!(rows.iter().any(|row| row.contains("STATUS")), "{rows:?}");
+        rl.completion.select(0);
+        let rows = screen_rows(&mut rl);
+        assert!(rows.iter().all(|row| !row.contains("STATUS")), "{rows:?}");
+    }
+
+    #[test]
+    fn suggestions_that_would_change_nothing_draw_no_list_and_no_virtual_text() {
+        let line = "ls | where size > 1kb";
+        let size = |value: &str| Suggestion {
+            value: value.into(),
+            span: Span::new(11, 15),
+            ..Suggestion::default()
+        };
+        let moved_into_the_word = |items| {
+            let mut rl = engine_offering("x", items);
+            rl.run_edit_commands(&[
+                EditCommand::Clear,
+                EditCommand::InsertString(line.into()),
+                EditCommand::MoveToPosition {
+                    position: 14,
+                    select: false,
+                },
+            ]);
+            rl
+        };
+
+        // The lone one, with the cursor after `siz`, and several that are all there already.
+        for items in [vec![size("size")], vec![size("size"), size("size")]] {
+            let mut rl = moved_into_the_word(items);
+            let rows = screen_rows(&mut rl);
+            assert!(rows[0].ends_with(line), "no virtual text: {rows:?}");
+            assert!(
+                rows[1..].iter().all(|row| row.is_empty()),
+                "no list: {rows:?}"
+            );
+            assert_eq!(rl.completion.drawn(), Drawn::Nothing);
+        }
+
+        // One of several that would: the list stays.
+        let mut rl = moved_into_the_word(vec![size("size"), size("sizes")]);
+        let rows = screen_rows(&mut rl);
+        assert_eq!(rl.completion.drawn(), Drawn::Panel);
+        assert!(
+            rows.iter().any(|row| framed(row) == Some("size")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| framed(row) == Some("sizes")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_virtual_text_is_drawn_at_the_cursor_in_the_middle_of_the_line() {
+        let word = Suggestion {
+            value: "where".into(),
+            span: Span::new(5, 8),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("x", vec![word]);
+        rl.run_edit_commands(&[
+            EditCommand::Clear,
+            EditCommand::InsertString("ls | whe > 1kb".into()),
+            EditCommand::MoveToPosition {
+                position: 8,
+                select: false,
+            },
+        ]);
+
+        let rows = screen_rows(&mut rl);
+        assert!(rows[0].ends_with("ls | where > 1kb"), "{rows:?}");
+        assert_eq!(rl.completion.drawn(), Drawn::Ghost);
+        // The cursor stays after what is typed, and the text after it moves right.
+        let (column, row) = place_of(&rows, "ls | whe").expect("the line");
+        assert_eq!(rl.painter.screen_cursor_for_test(), (column + 8, row));
+        assert_eq!(rl.current_buffer_contents(), "ls | whe > 1kb");
+    }
+
+    #[test]
+    fn the_cell_the_cursor_lands_on_in_the_virtual_text_is_a_gap_in_its_underline() {
+        let template = Suggestion {
+            value: "each {  }".into(),
+            display_override: Some("each".into()),
+            span: Span::new(5, 8),
+            cursor: Some(12),
+            ..Suggestion::default()
+        };
+        let mut rl = engine_offering("ls | eac", vec![template]);
+
+        let rows = screen_rows(&mut rl);
+        assert!(
+            rows[0].ends_with("ls | each {  }"),
+            "nothing is shifted: {rows:?}"
+        );
+        let style = |rl: &mut Reedline, text: &str, at: usize| {
+            let (column, row) = place_of(&rows, text).expect("on screen");
+            rl.painter
+                .screen_cell_style_for_test(row, column + at as u16)
+        };
+        // The cursor lands between the braces, on the second of the two spaces.
+        assert_eq!(
+            style(&mut rl, "h {  }", 4),
+            Some((true, false, false)),
+            "dim, not underlined"
+        );
+        assert_eq!(
+            style(&mut rl, "h {  }", 0),
+            Some((true, true, false)),
+            "the rest of it"
+        );
+        assert_eq!(
+            style(&mut rl, "ls | eac", 3).map(|s| s.2),
+            Some(false),
+            "what is typed"
+        );
+    }
+
+    #[test]
+    fn the_virtual_text_marks_the_landing_cell_only_inside_it() {
+        let gap = Style::new().dimmed().paint("x").to_string();
+        let mark = gap.split('x').next().expect("a prefix");
+
+        assert!(ghost_text("h {  }", Some(5)).contains(&format!("{mark}}}")));
+        assert!(ghost_text("h {  }", Some(0)).contains(&format!("{mark}h")));
+        assert!(!ghost_text("h {  }", None).contains(mark));
+        assert!(
+            !ghost_text("h {  }", Some(6)).contains(mark),
+            "past its end"
+        );
+        assert!(!ghost_text("h {  }", Some(60)).contains(mark));
+        assert_eq!(
+            crate::painting::strip_ansi(&ghost_text("é {  }", Some(1))),
+            "é {  }",
+            "a landing inside a char falls back to its start"
+        );
     }
 }

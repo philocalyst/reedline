@@ -12,8 +12,8 @@
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, DefaultCompleter, DefaultPrompt, Emacs, KeyCode,
-    KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, StatusLine,
+    default_emacs_keybindings, DefaultCompleter, DefaultPrompt, Emacs, KeyCode, KeyModifiers,
+    Reedline, ReedlineEvent, ReedlineMenu, Signal, StatusLine,
 };
 use std::io;
 use unicode_width::UnicodeWidthChar;
@@ -145,7 +145,7 @@ fn main() -> io::Result<()> {
     let mut words: Vec<String> = COMMANDS.iter().map(|(name, _)| name.to_string()).collect();
     words.extend(["world".into(), "wonderland".into()]);
     let completer = Box::new(DefaultCompleter::new_with_wordlen(words, 2));
-    let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+    let completion_menu = ReedlineMenu::new("completion_menu");
 
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
@@ -160,7 +160,7 @@ fn main() -> io::Result<()> {
     let mut line_editor = Reedline::create()
         .with_status_line(Box::new(CommandHelp))
         .with_completer(completer)
-        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_menu(completion_menu)
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
     let prompt = DefaultPrompt::default();
 
